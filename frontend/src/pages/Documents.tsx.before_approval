@@ -1,0 +1,94 @@
+import { apiDownload, apiGet } from "../api/client";
+import { ErrorBox, StatusPill, formatDate } from "../components/ui";
+import { pick, pickString, scoreToPercent, toArray, useLoad } from "../lib/data";
+
+type Row = Record<string, unknown>;
+
+// Needs GET /scans (not built yet). Fields used (ASSUMED):
+//   id, title, created_at, certificate_generated (bool) or certificate_number,
+//   approval_status, admin_approval_date, plagiarism_score, ai_score
+export default function Documents() {
+  const { data, error, loading } = useLoad(() => apiGet<unknown>("/scans"), []);
+  const rows = toArray<Row>(data);
+
+  const missing = error && /not found|method not allowed|404|405/i.test(error);
+
+  return (
+    <>
+      <h1>Previous Documents</h1>
+      {missing ? (
+        <div className="notice">
+          The backend does not provide <code>GET /scans</code> yet, so there is nothing to list. Once that endpoint exists
+          this table fills in automatically.
+        </div>
+      ) : (
+        <ErrorBox message={error} />
+      )}
+      <div className="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Sr No.</th>
+              <th>Title</th>
+              <th>Scanned On</th>
+              <th>Certificate Generated</th>
+              <th>Admin Approval Date</th>
+              <th>Approval Status</th>
+              <th>Plagiarism Score</th>
+              <th>AI Score</th>
+              <th>Certificate</th>
+            </tr>
+          </thead>
+          <tbody>
+            {loading && (
+              <tr>
+                <td colSpan={9}>Loading…</td>
+              </tr>
+            )}
+            {!loading && rows.length === 0 && !error && (
+              <tr>
+                <td colSpan={9} className="muted">
+                  No documents scanned yet.
+                </td>
+              </tr>
+            )}
+            {rows.map((row, index) => {
+              const hasCertificate =
+                row.certificate_generated === true || !!pick(row, "certificate_number", "certificate_id");
+              const ai = scoreToPercent(row.ai_score);
+              const plag = scoreToPercent(pick(row, "plagiarism_score", "overall_similarity"));
+              return (
+                <tr key={String(row.id ?? index)}>
+                  <td>{index + 1}</td>
+                  <td className="left">{pickString(row, "title")}</td>
+                  <td>{formatDate(pickString(row, "created_at", "scanned_on"))}</td>
+                  <td>
+                    <span className={`pill ${hasCertificate ? "green" : "red"}`}>{hasCertificate ? "Yes" : "No"}</span>
+                  </td>
+                  <td>{formatDate(pickString(row, "admin_approval_date", "approved_at") || null)}</td>
+                  <td>
+                    <StatusPill status={pickString(row, "approval_status") || null} />
+                  </td>
+                  <td>{plag === null ? "—" : `${plag}%`}</td>
+                  <td>{ai === null ? "—" : `${ai}%`}</td>
+                  <td>
+                    {hasCertificate && (
+                      <button
+                        className="btn small ghost"
+                        onClick={() =>
+                          apiDownload(`/scans/${row.id}/certificate/download`, "certificate.pdf").catch(() => undefined)
+                        }
+                      >
+                        Download
+                      </button>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </>
+  );
+}

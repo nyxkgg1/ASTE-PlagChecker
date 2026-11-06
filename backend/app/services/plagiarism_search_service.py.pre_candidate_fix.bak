@@ -1,0 +1,869 @@
+from __future__ import annotations
+
+from collections import defaultdict
+
+from sqlalchemy.orm import Session
+
+from app.models.plagiarism_fingerprint import ReferenceSentenceFingerprint
+from app.services.plagiarism_fingerprint_service import (
+    character_similarity,
+    exact_text_similarity,
+    generate_ngram_fingerprints,
+    generate_character_ngram_fingerprints,
+    ngram_similarity,
+)
+from app.models.reference import ReferenceSentence
+from app.models.scan import ScanSentence
+
+from app.services.plagiarism_fingerprint_service import (
+    exact_text_similarity,
+    generate_ngram_fingerprints,
+    ngram_similarity,
+)
+
+from app.services.reference_embedding_search_service import (
+    search_reference_embeddings,
+)
+
+from app.services.tfidf_similarity_service import (
+    calculate_tfidf_similarity,
+)
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+DEFAULT_NGRAM_SIZES = (3, 5)
+
+# Maximum number of lexical candidates for one scan sentence.
+MAX_CANDIDATES_PER_SENTENCE = 20
+
+# Maximum number of semantic candidates for one scan sentence.
+MAX_SEMANTIC_CANDIDATES_PER_SENTENCE = 10
+
+# Minimum semantic similarity required for a reference sentence
+# to become a semantic candidate.
+CANDIDATE_SEMANTIC_THRESHOLD = 0.55
+
+# Very short sentences/fragments should generally not be
+# considered for plagiarism detection.
+#
+# Examples:
+#   14
+#   4.4.
+#   Table 1.
+#   Yes.
+MIN_PLAGIARISM_TOKENS = 5
+
+
+# ============================================================
+# TEXT VALIDATION
+# ============================================================
+
+def has_minimum_tokens(
+    text: str,
+    minimum: int = MIN_PLAGIARISM_TOKENS,
+) -> bool:
+    """
+    Check whether text contains enough whitespace-separated
+    tokens to perform meaningful plagiarism comparison.
+
+    This is intentionally calculated from the text rather than
+    using ReferenceSentence.token_count because the current
+    ReferenceSentence model does not contain a token_count field.
+    """
+
+    if not text:
+        return False
+
+    tokens = text.split()
+
+    return len(tokens) >= minimum
+
+
+# ============================================================
+# LEXICAL CANDIDATE SEARCH
+# ============================================================
+# LEXICAL CANDIDATE SEARCH
+# ============================================================
+
+def find_fingerprint_candidates(
+    db: Session,
+    scan_sentence: ScanSentence,
+) -> list[ReferenceSentence]:
+    """
+    Retrieve lexical candidates using WORD and CHARACTER fingerprints.
+
+    Character fingerprints help recover candidates when PDF extraction
+    joins words together. They are candidate-retrieval evidence only;
+    final plagiarism scoring and acceptance rules remain unchanged.
+    """
+
+    if scan_sentence.token_count < MIN_PLAGIARISM_TOKENS:
+        return []
+
+    candidate_scores: defaultdict[str, int] = defaultdict(int)
+
+    # --------------------------------------------------------
+    # 1. Existing word n-gram retrieval
+    # --------------------------------------------------------
+
+    for ngram_size in DEFAULT_NGRAM_SIZES:
+        fingerprints = generate_ngram_fingerprints(
+            scan_sentence.normalized_text,
+            n=ngram_size,
+        )
+
+        if not fingerprints:
+            continue
+
+        rows = (
+            db.query(
+                ReferenceSentenceFingerprint.reference_sentence_id
+            )
+            .filter(
+                ReferenceSentenceFingerprint.fingerprint_type == "WORD",
+                ReferenceSentenceFingerprint.ngram_size == ngram_size,
+                ReferenceSentenceFingerprint.fingerprint_hash.in_(
+                    fingerprints
+                ),
+            )
+            .all()
+        )
+
+        for row in rows:
+            candidate_scores[str(row.reference_sentence_id)] += 1
+
+    # --------------------------------------------------------
+    # 2. Character n-gram retrieval
+    # --------------------------------------------------------
+
+    MIN_SHARED_CHARACTER_FINGERPRINTS = 8
+    CHARACTER_NGRAM_SIZE = 4
+    MAX_CHARACTER_RANKING_BONUS = 10
+
+    character_fingerprints = generate_character_ngram_fingerprints(
+        scan_sentence.normalized_text or "",
+        n=CHARACTER_NGRAM_SIZE,
+    )
+
+    if character_fingerprints:
+        character_rows = (
+            db.query(
+                ReferenceSentenceFingerprint.reference_sentence_id
+            )
+            .filter(
+                ReferenceSentenceFingerprint.fingerprint_type
+                == "CHARACTER",
+                ReferenceSentenceFingerprint.ngram_size
+                == CHARACTER_NGRAM_SIZE,
+                ReferenceSentenceFingerprint.fingerprint_hash.in_(
+                    character_fingerprints
+                ),
+            )
+            .all()
+        )
+
+        character_scores: defaultdict[str, int] = defaultdict(int)
+
+        for row in character_rows:
+            character_scores[str(row.reference_sentence_id)] += 1
+
+        # Require enough shared fingerprints to reduce weak,
+        # coincidental matches from common character sequences.
+        for reference_id, shared_count in character_scores.items():
+            if shared_count >= MIN_SHARED_CHARACTER_FINGERPRINTS:
+                candidate_scores[reference_id] += min(
+                    shared_count,
+                    MAX_CHARACTER_RANKING_BONUS,
+                )
+
+    if not candidate_scores:
+        return []
+
+    # --------------------------------------------------------
+    # 3. Rank and cap candidates
+    # --------------------------------------------------------
+
+    ranked_ids = sorted(
+        candidate_scores,
+        key=lambda reference_id: candidate_scores[reference_id],
+        reverse=True,
+    )[:MAX_CANDIDATES_PER_SENTENCE]
+
+    references = (
+        db.query(ReferenceSentence)
+        .filter(ReferenceSentence.id.in_(ranked_ids))
+        .all()
+    )
+
+    references = [
+        reference
+        for reference in references
+        if has_minimum_tokens(reference.normalized_text)
+    ]
+
+    reference_map = {
+        str(reference.id): reference
+        for reference in references
+    }
+
+    return [
+        reference_map[reference_id]
+        for reference_id in ranked_ids
+        if reference_id in reference_map
+    ]
+
+
+
+# ============================================================
+# LEXICAL COMPARISON
+# ============================================================
+
+
+def compare_lexical_candidate(
+    scan_sentence: ScanSentence,
+    reference: ReferenceSentence,
+) -> dict:
+    """
+    Compare one scan sentence against one reference sentence.
+
+    Character similarity is collected for diagnostics only.
+    Existing matching and acceptance rules remain unchanged.
+    """
+    exact_score = exact_text_similarity(
+        scan_sentence.normalized_text,
+        reference.normalized_text,
+    )
+
+    ngram_score = ngram_similarity(
+        scan_sentence.normalized_text,
+        reference.normalized_text,
+        n=5,
+    )
+
+    tfidf_score = calculate_tfidf_similarity(
+        scan_sentence.normalized_text,
+        reference.normalized_text,
+    )
+
+    character_score = character_similarity(
+        scan_sentence.normalized_text,
+        reference.normalized_text,
+    )
+
+    return {
+        "reference": reference,
+        "exact_score": float(exact_score),
+        "ngram_score": float(ngram_score),
+        "tfidf_score": float(tfidf_score),
+        "character_score": float(character_score),
+    }
+
+
+
+# ============================================================
+# SEMANTIC CANDIDATE SEARCH
+# ============================================================
+
+def find_semantic_candidates(
+    db: Session,
+    scan_sentence: ScanSentence,
+) -> list[dict]:
+    """
+    Search the reference embedding index for semantically similar
+    reference sentences.
+
+    Semantic similarity is used for candidate generation.
+
+    Semantic similarity alone is NOT sufficient evidence of
+    plagiarism.
+    """
+
+    if scan_sentence.token_count < MIN_PLAGIARISM_TOKENS:
+        return []
+
+    results = search_reference_embeddings(
+        db=db,
+        query_text=scan_sentence.raw_text,
+        limit=MAX_SEMANTIC_CANDIDATES_PER_SENTENCE,
+        min_similarity=CANDIDATE_SEMANTIC_THRESHOLD,
+    )
+
+    return results or []
+
+
+# ============================================================
+# COMBINED CANDIDATE EVIDENCE
+# ============================================================
+
+def build_combined_match(
+    lexical_result: dict | None,
+    semantic_result: dict | None,
+) -> dict:
+    """
+    Combine lexical and semantic evidence for one candidate.
+
+    This function produces the evidence values.
+
+    Final evidence acceptance is handled separately by
+    has_significant_evidence().
+    """
+
+    if (
+        lexical_result is None
+        and semantic_result is None
+    ):
+        return {}
+
+    # --------------------------------------------------------
+    # Lexical scores
+    # --------------------------------------------------------
+
+    if lexical_result is not None:
+
+        reference = lexical_result.get("reference")
+
+        exact_score = float(
+            lexical_result.get(
+                "exact_score",
+                0.0,
+            )
+        )
+
+        ngram_score = float(
+            lexical_result.get(
+                "ngram_score",
+                0.0,
+            )
+        )
+
+        tfidf_score = float(
+            lexical_result.get(
+                "tfidf_score",
+                0.0,
+            )
+        )
+
+    else:
+
+        reference = None
+
+        exact_score = 0.0
+        ngram_score = 0.0
+        tfidf_score = 0.0
+
+    # --------------------------------------------------------
+    # Semantic score
+    # --------------------------------------------------------
+
+    semantic_score = 0.0
+
+    if semantic_result is not None:
+
+        semantic_score = float(
+            semantic_result.get(
+                "similarity",
+                0.0,
+            )
+        )
+
+    # --------------------------------------------------------
+    # Preliminary score
+    # --------------------------------------------------------
+
+    if exact_score >= 1.0:
+
+        final_score = 1.0
+        method = "EXACT"
+
+    elif ngram_score >= 0.80:
+
+        final_score = ngram_score
+        method = "NGRAM"
+
+    else:
+
+        # Conservative combination.
+        #
+        # Semantic similarity receives significant weight for
+        # paraphrases, but lexical evidence is still required
+        # later by has_significant_evidence().
+
+        final_score = (
+            (0.30 * ngram_score)
+            + (0.25 * tfidf_score)
+            + (0.45 * semantic_score)
+        )
+
+        if (
+            semantic_score >= 0.85
+            and (
+                tfidf_score >= 0.20
+                or ngram_score >= 0.10
+            )
+        ):
+            method = "SEMANTIC"
+
+        elif ngram_score >= tfidf_score:
+            method = "NGRAM"
+
+        else:
+            method = "TFIDF"
+
+    return {
+        "reference": reference,
+        "exact_score": exact_score,
+        "ngram_score": ngram_score,
+        "tfidf_score": tfidf_score,
+        "semantic_score": semantic_score,
+        "final_score": max(
+            0.0,
+            min(1.0, float(final_score)),
+        ),
+        "method": method,
+    }
+
+
+# ============================================================
+# SIGNIFICANT EVIDENCE FILTER
+# ============================================================
+
+def has_significant_evidence(
+    *,
+    exact_score: float,
+    ngram_score: float,
+    tfidf_score: float,
+    semantic_score: float,
+) -> bool:
+    """
+    Determine whether a candidate has enough evidence to be
+    treated as a significant plagiarism match.
+
+    IMPORTANT:
+
+    Semantic similarity alone is deliberately NOT sufficient.
+
+    This prevents semantically related but independently written
+    technical content from automatically becoming plagiarism.
+    """
+
+    # --------------------------------------------------------
+    # 1. Strong exact/textual evidence
+    # --------------------------------------------------------
+
+    if exact_score >= 0.80:
+        return True
+
+    # --------------------------------------------------------
+    # 2. Strong n-gram overlap
+    # --------------------------------------------------------
+
+    if ngram_score >= 0.40:
+        return True
+
+    # --------------------------------------------------------
+    # 3. Strong TF-IDF similarity
+    # --------------------------------------------------------
+
+    if tfidf_score >= 0.50:
+        return True
+
+    # --------------------------------------------------------
+    # 4. Strong semantic similarity + textual evidence
+    # --------------------------------------------------------
+
+    if semantic_score >= 0.85:
+
+        if tfidf_score >= 0.20:
+            return True
+
+        if ngram_score >= 0.10:
+            return True
+
+    # --------------------------------------------------------
+    # 5. Moderate semantic similarity requires stronger
+    #    lexical evidence.
+    # --------------------------------------------------------
+
+    if semantic_score >= 0.75:
+
+        if (
+            tfidf_score >= 0.30
+            and ngram_score >= 0.15
+        ):
+            return True
+
+    return False
+
+
+# ============================================================
+# MATCH CLASSIFICATION
+# ============================================================
+
+def determine_match_type(
+    *,
+    exact_score: float,
+    ngram_score: float,
+    tfidf_score: float,
+    semantic_score: float,
+) -> str:
+    """
+    Convert individual evidence scores into a match category.
+    """
+
+    # --------------------------------------------------------
+    # Exact
+    # --------------------------------------------------------
+
+    if exact_score >= 1.0:
+        return "EXACT"
+
+    # --------------------------------------------------------
+    # Strong textual match
+    # --------------------------------------------------------
+
+    if (
+        ngram_score >= 0.80
+        or (
+            ngram_score >= 0.45
+            and tfidf_score >= 0.50
+        )
+    ):
+        return "STRONG_TEXTUAL_MATCH"
+
+    # --------------------------------------------------------
+    # High similarity
+    # --------------------------------------------------------
+
+    if (
+        semantic_score >= 0.85
+        and (
+            tfidf_score >= 0.20
+            or ngram_score >= 0.10
+        )
+    ):
+        return "HIGH_SIMILARITY"
+
+    # --------------------------------------------------------
+    # Moderate similarity
+    # --------------------------------------------------------
+
+    if (
+        semantic_score >= 0.75
+        and tfidf_score >= 0.30
+    ):
+        return "MODERATE_SIMILARITY"
+
+    # --------------------------------------------------------
+    # Low similarity
+    # --------------------------------------------------------
+
+    if (
+        ngram_score >= 0.25
+        or tfidf_score >= 0.35
+    ):
+        return "LOW_SIMILARITY"
+
+    return "NO_SIGNIFICANT_MATCH"
+
+
+# ============================================================
+# MAIN PLAGIARISM SEARCH
+# ============================================================
+
+def search_plagiarism_candidates(
+    db: Session,
+    scan_id,
+) -> list[dict]:
+    """
+    Main plagiarism candidate generation and verification
+    pipeline.
+
+    Flow:
+
+        Scan sentence
+             |
+             +---- Fingerprint search
+             |
+             +---- BGE semantic search
+             |
+             v
+        Candidate union
+             |
+             v
+        Detailed comparison
+             |
+             v
+        Evidence filtering
+             |
+             v
+        Significant matches
+    """
+
+    # ========================================================
+    # Load scan sentences
+    # ========================================================
+
+    scan_sentences = (
+        db.query(ScanSentence)
+        .filter(
+            ScanSentence.scan_id == scan_id,
+            ScanSentence.token_count >= MIN_PLAGIARISM_TOKENS,
+        )
+        .order_by(
+            ScanSentence.page_id,
+            ScanSentence.sentence_index,
+        )
+        .all()
+    )
+
+    matches: list[dict] = []
+
+    # ========================================================
+    # Process each scan sentence
+    # ========================================================
+
+    for scan_sentence in scan_sentences:
+
+        # ----------------------------------------------------
+        # 1. Lexical candidate generation
+        # ----------------------------------------------------
+
+        lexical_candidates = find_fingerprint_candidates(
+            db=db,
+            scan_sentence=scan_sentence,
+        )
+
+        lexical_results: dict[str, dict] = {}
+
+        for reference in lexical_candidates:
+
+            result = compare_lexical_candidate(
+                scan_sentence=scan_sentence,
+                reference=reference,
+            )
+
+            lexical_results[
+                str(reference.id)
+            ] = result
+
+        # ----------------------------------------------------
+        # 2. Semantic candidate generation
+        # ----------------------------------------------------
+
+        semantic_candidates = find_semantic_candidates(
+            db=db,
+            scan_sentence=scan_sentence,
+        )
+
+        semantic_results: dict[str, dict] = {}
+
+        for result in semantic_candidates:
+
+            sentence_id = result.get(
+                "sentence_id"
+            )
+
+            if sentence_id is None:
+                continue
+
+            semantic_results[
+                str(sentence_id)
+            ] = result
+
+        # ----------------------------------------------------
+        # 3. Combine lexical + semantic candidate IDs
+        # ----------------------------------------------------
+
+        candidate_ids = (
+            set(lexical_results.keys())
+            | set(semantic_results.keys())
+        )
+
+        if not candidate_ids:
+            continue
+
+        # ----------------------------------------------------
+        # 4. Detailed comparison
+        # ----------------------------------------------------
+
+        for candidate_id in candidate_ids:
+
+            lexical_result = lexical_results.get(
+                candidate_id
+            )
+
+            semantic_result = semantic_results.get(
+                candidate_id
+            )
+
+            # ------------------------------------------------
+            # Semantic-only candidate
+            # ------------------------------------------------
+
+            if lexical_result is None:
+
+                reference = (
+                    db.query(ReferenceSentence)
+                    .filter(
+                        ReferenceSentence.id
+                        == candidate_id
+                    )
+                    .first()
+                )
+
+                if reference is None:
+                    continue
+
+                # ReferenceSentence has no token_count field.
+                if not has_minimum_tokens(
+                    reference.normalized_text
+                ):
+                    continue
+
+                lexical_result = {
+                    "reference": reference,
+                    "exact_score": 0.0,
+                    "ngram_score": 0.0,
+                    "tfidf_score": 0.0,
+                }
+
+            # ------------------------------------------------
+            # Combine evidence
+            # ------------------------------------------------
+
+            combined = build_combined_match(
+                lexical_result=lexical_result,
+                semantic_result=semantic_result,
+            )
+
+            if not combined:
+                continue
+
+            reference = combined.get(
+                "reference"
+            )
+
+            if reference is None:
+                continue
+
+            # ------------------------------------------------
+            # Extract scores
+            # ------------------------------------------------
+
+            exact_score = float(
+                combined.get(
+                    "exact_score",
+                    0.0,
+                )
+            )
+
+            ngram_score = float(
+                combined.get(
+                    "ngram_score",
+                    0.0,
+                )
+            )
+
+            tfidf_score = float(
+                combined.get(
+                    "tfidf_score",
+                    0.0,
+                )
+            )
+
+            semantic_score = float(
+                combined.get(
+                    "semantic_score",
+                    0.0,
+                )
+            )
+
+            # ------------------------------------------------
+            # Evidence validation
+            # ------------------------------------------------
+
+            if not has_significant_evidence(
+                exact_score=exact_score,
+                ngram_score=ngram_score,
+                tfidf_score=tfidf_score,
+                semantic_score=semantic_score,
+            ):
+                continue
+
+            # ------------------------------------------------
+            # Classification
+            # ------------------------------------------------
+
+            match_type = determine_match_type(
+                exact_score=exact_score,
+                ngram_score=ngram_score,
+                tfidf_score=tfidf_score,
+                semantic_score=semantic_score,
+            )
+
+            if match_type == "NO_SIGNIFICANT_MATCH":
+                continue
+
+            # ------------------------------------------------
+            # Final similarity score
+            # ------------------------------------------------
+
+            if exact_score >= 1.0:
+
+                similarity_score = 1.0
+
+            elif ngram_score >= 0.80:
+
+                similarity_score = ngram_score
+
+            else:
+
+                similarity_score = (
+                    (0.30 * ngram_score)
+                    + (0.25 * tfidf_score)
+                    + (0.45 * semantic_score)
+                )
+
+            similarity_score = max(
+                0.0,
+                min(
+                    1.0,
+                    float(similarity_score),
+                ),
+            )
+
+            # ------------------------------------------------
+            # Store candidate
+            # ------------------------------------------------
+
+            matches.append(
+                {
+                    "scan_sentence": scan_sentence,
+                    "reference_sentence": reference,
+                    "exact_score": exact_score,
+                    "ngram_score": ngram_score,
+                    "tfidf_score": tfidf_score,
+                    "semantic_score": semantic_score,
+                    "similarity_score": similarity_score,
+                    "method": match_type,
+                }
+            )
+
+    # ========================================================
+    # Sort strongest matches first
+    # ========================================================
+
+    matches.sort(
+        key=lambda item: (
+            item["similarity_score"],
+            item["exact_score"],
+            item["ngram_score"],
+            item["tfidf_score"],
+            item["semantic_score"],
+        ),
+        reverse=True,
+    )
+    return matches

@@ -1,11 +1,12 @@
-# Local AI model weights
+# AI models - stored locally only
 /models/Qwen3-0.6B-Base/
 /models/ai-text-detector-modernbert/
 /models/bge-base-en-v1.5/
 /models/bge-large-en-v1.5/
 
-# Local secrets and generated files
+# Secrets and generated data
 /backend/.env
 /backend/.venv/
 /frontend/node_modules/
 /uploads/
+

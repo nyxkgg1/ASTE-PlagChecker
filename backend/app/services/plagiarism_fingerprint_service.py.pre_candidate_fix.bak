@@ -1,0 +1,202 @@
+
+import hashlib
+import re
+
+
+def normalize_for_matching(text: str) -> str:
+    """Normalize text for lexical comparison."""
+    text = text.lower()
+
+    text = re.sub(
+        r"[^a-z0-9\s]",
+        " ",
+        text,
+    )
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        text,
+    )
+
+    return text.strip()
+
+
+def tokenize(text: str) -> list[str]:
+    """Normalize and split text into tokens."""
+    normalized = normalize_for_matching(text)
+
+    if not normalized:
+        return []
+
+    return normalized.split()
+
+
+def generate_ngrams(
+    tokens: list[str],
+    n: int,
+) -> list[tuple[str, ...]]:
+    """Generate word-level n-grams."""
+    if n <= 0 or len(tokens) < n:
+        return []
+
+    return [
+        tuple(tokens[i:i + n])
+        for i in range(len(tokens) - n + 1)
+    ]
+
+
+def hash_ngram(
+    ngram: tuple[str, ...],
+) -> str:
+    """Generate a SHA-256 hash for a word n-gram."""
+    value = " ".join(ngram)
+
+    return hashlib.sha256(
+        value.encode("utf-8")
+    ).hexdigest()
+
+
+def generate_ngram_fingerprints(
+    text: str,
+    n: int = 5,
+) -> set[str]:
+    """Generate word-level n-gram fingerprints."""
+    tokens = tokenize(text)
+
+    ngrams = generate_ngrams(
+        tokens,
+        n,
+    )
+
+    return {
+        hash_ngram(ngram)
+        for ngram in ngrams
+    }
+
+
+
+def generate_character_ngram_fingerprints(
+    text: str,
+    n: int = 4,
+) -> set[str]:
+    """
+    Generate SHA-256 fingerprints for normalized character n-grams.
+
+    Whitespace is removed after normalization so a joined-word
+    extraction such as 'calibratedinstrumentation' can share
+    character fingerprints with 'calibrated instrumentation'.
+
+    These fingerprints are for candidate retrieval only; they
+    are not proof of plagiarism.
+    """
+    if n <= 0:
+        raise ValueError("n must be greater than zero")
+
+    normalized = normalize_for_matching(text)
+    compact = re.sub(r"\\s+", "", normalized)
+
+    if len(compact) < n:
+        return set()
+
+    return {
+        hashlib.sha256(
+            compact[i:i + n].encode("utf-8")
+        ).hexdigest()
+        for i in range(len(compact) - n + 1)
+    }
+
+
+def exact_text_similarity(
+    text_a: str,
+    text_b: str,
+) -> float:
+    """Return 1.0 for identical normalized text, otherwise 0.0."""
+    a = normalize_for_matching(text_a)
+    b = normalize_for_matching(text_b)
+
+    if not a or not b:
+        return 0.0
+
+    if a == b:
+        return 1.0
+
+    return 0.0
+
+
+def ngram_similarity(
+    text_a: str,
+    text_b: str,
+    n: int = 5,
+) -> float:
+    """Calculate Jaccard similarity between word n-grams."""
+    fingerprints_a = generate_ngram_fingerprints(
+        text_a,
+        n,
+    )
+
+    fingerprints_b = generate_ngram_fingerprints(
+        text_b,
+        n,
+    )
+
+    if not fingerprints_a or not fingerprints_b:
+        return 0.0
+
+    intersection = fingerprints_a.intersection(
+        fingerprints_b
+    )
+
+    union = fingerprints_a.union(
+        fingerprints_b
+    )
+
+    if not union:
+        return 0.0
+
+    return len(intersection) / len(union)
+
+
+def character_similarity(
+    text_a: str,
+    text_b: str,
+    n: int = 4,
+) -> float:
+    """
+    Calculate Jaccard similarity between character n-grams.
+
+    This can help identify near-identical text when PDF extraction
+    accidentally joins adjacent words, such as:
+        calibrated instrumentation
+        calibratedinstrumentation
+
+    This score is diagnostic only until separately validated.
+    It must not be treated as proof of plagiarism on its own.
+    """
+    if n <= 0:
+        raise ValueError("n must be greater than zero")
+
+    def fingerprints(text: str) -> set[str]:
+        normalized = normalize_for_matching(text)
+
+        if len(normalized) < n:
+            return set()
+
+        return {
+            normalized[i:i + n]
+            for i in range(len(normalized) - n + 1)
+        }
+
+    grams_a = fingerprints(text_a)
+    grams_b = fingerprints(text_b)
+
+    if not grams_a or not grams_b:
+        return 0.0
+
+    intersection = grams_a.intersection(grams_b)
+    union = grams_a.union(grams_b)
+
+    if not union:
+        return 0.0
+
+    return len(intersection) / len(union)

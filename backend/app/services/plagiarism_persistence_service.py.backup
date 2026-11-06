@@ -1,0 +1,846 @@
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+
+from sqlalchemy.orm import Session
+
+from app.models.plagiarism import (
+    PlagiarismAnalysis,
+    PlagiarismMatch,
+)
+
+from app.models.scan import ScanSentence
+
+from app.services.plagiarism_search_service import (
+    search_plagiarism_candidates,
+)
+
+from app.services.plagiarism_scoring_service import (
+    calculate_combined_score,
+    calculate_document_score,
+)
+
+
+ALGORITHM_VERSION = "2.3.0"
+
+
+def save_plagiarism_analysis(
+    db: Session,
+    *,
+    scan_id,
+    initiated_by,
+) -> PlagiarismAnalysis:
+
+    analysis = PlagiarismAnalysis(
+        scan_id=scan_id,
+        initiated_by=initiated_by,
+        status="PROCESSING",
+        algorithm_version=ALGORITHM_VERSION,
+    )
+
+    db.add(analysis)
+    db.flush()
+
+    try:
+
+        # ====================================================
+        # 1. LOAD ALL SCAN SENTENCES
+        # ====================================================
+        #
+        # Every scan sentence gets exactly ONE scoring slot.
+        #
+        # This is the most important scoring safeguard.
+        #
+        # Multiple reference documents may match the same
+        # sentence, but they must NEVER create multiple scoring
+        # slots.
+        # ====================================================
+
+        scan_sentences = (
+            db.query(ScanSentence)
+            .filter(
+                ScanSentence.scan_id == scan_id
+            )
+            .order_by(
+                ScanSentence.sentence_index
+            )
+            .all()
+        )
+
+        # ====================================================
+        # 2. CREATE BASELINE SCORING RESULT
+        # ====================================================
+
+        sentence_results_by_id: dict[
+            str,
+            dict
+        ] = {}
+
+        for sentence in scan_sentences:
+
+            sentence_id = str(
+                sentence.id
+            )
+
+            sentence_results_by_id[
+                sentence_id
+            ] = {
+                "combined_score": 0.0,
+
+                "match_type": (
+                    "NO_SIGNIFICANT_MATCH"
+                ),
+
+                "text_length": len(
+                    sentence.raw_text or ""
+                ),
+
+                "exact_score": 0.0,
+                "ngram_score": 0.0,
+                "tfidf_score": 0.0,
+                "semantic_score": 0.0,
+            }
+
+        # ====================================================
+        # 3. SEARCH FOR PLAGIARISM CANDIDATES
+        # ====================================================
+
+        matches = search_plagiarism_candidates(
+            db=db,
+            scan_id=scan_id,
+        )
+        print()
+        print("=" * 80)
+        print("PERSISTENCE INPUT DIAGNOSTIC")
+        print("=" * 80)
+
+        for index, match in enumerate(matches, start=1):
+
+            scan_sentence = match["scan_sentence"]
+            reference_sentence = match["reference_sentence"]
+
+            print()
+            print(f"MATCH {index}")
+            print(f"Scan sentence ID: {scan_sentence.id}")
+            print(
+                f"Reference document ID: "
+                f"{reference_sentence.reference_document_id}"
+            )
+            print(
+                f"Reference sentence ID: "
+                f"{reference_sentence.id}"
+            )
+            print(f"Exact: {match.get('exact_score')}")
+            print(f"Ngram: {match.get('ngram_score')}")
+            print(f"TFIDF: {match.get('tfidf_score')}")
+            print(f"Semantic: {match.get('semantic_score')}")
+            print(f"Method: {match.get('method')}")
+
+        print()
+        print("=" * 80)
+        print("END PERSISTENCE INPUT DIAGNOSTIC")
+        print("=" * 80)
+
+        # ====================================================
+        # 4. MATCH STORAGE STRUCTURES
+        # ====================================================
+        #
+        # best_sentence_matches
+        #
+        #     ONE strongest result per scan sentence.
+        #
+        #     Used for document scoring.
+        #
+        # exact_sentence_matches
+        #
+        #     ALL distinct exact reference matches.
+        #
+        #     Used for source attribution/persistence.
+        #
+        # Example:
+        #
+        # Sentence X:
+        #
+        #     Ref 1 -> EXACT
+        #     Ref 2 -> EXACT
+        #
+        # Persistence:
+        #
+        #     Save Ref 1
+        #     Save Ref 2
+        #
+        # Scoring:
+        #
+        #     Count Sentence X exactly ONCE.
+        # ====================================================
+
+        best_sentence_matches: dict[
+            str,
+            dict
+        ] = {}
+
+        exact_sentence_matches: dict[
+            str,
+            list[dict]
+        ] = {}
+
+        # ====================================================
+        # 5. PROCESS EVERY SEARCH RESULT
+        # ====================================================
+
+        for match in matches:
+
+            scan_sentence = match[
+                "scan_sentence"
+            ]
+
+            reference_sentence = match[
+                "reference_sentence"
+            ]
+
+            # ------------------------------------------------
+            # Extract individual scores safely
+            # ------------------------------------------------
+
+            exact_score = float(
+                match.get(
+                    "exact_score",
+                    0.0,
+                )
+            )
+
+            ngram_score = float(
+                match.get(
+                    "ngram_score",
+                    0.0,
+                )
+            )
+
+            tfidf_score = float(
+                match.get(
+                    "tfidf_score",
+                    0.0,
+                )
+            )
+
+            semantic_score = float(
+                match.get(
+                    "semantic_score",
+                    0.0,
+                )
+            )
+
+            # ------------------------------------------------
+            # Recalculate authoritative scoring result
+            # ------------------------------------------------
+
+            scoring = calculate_combined_score(
+                exact_score=exact_score,
+                ngram_score=ngram_score,
+                tfidf_score=tfidf_score,
+                semantic_score=semantic_score,
+            )
+
+            combined_score = float(
+                scoring["combined_score"]
+            )
+
+            match_type = scoring[
+                "match_type"
+            ]
+
+            # ------------------------------------------------
+            # Ignore insignificant candidates
+            # ------------------------------------------------
+
+            if match_type == "NO_SIGNIFICANT_MATCH":
+                continue
+
+            # ------------------------------------------------
+            # IDs used for deduplication
+            # ------------------------------------------------
+
+            sentence_id = str(
+                scan_sentence.id
+            )
+
+            reference_sentence_id = str(
+                reference_sentence.id
+            )
+
+            # ------------------------------------------------
+            # Build normalized match result
+            # ------------------------------------------------
+
+            sentence_result = {
+                "combined_score": combined_score,
+
+                "match_type": match_type,
+
+                "text_length": len(
+                    scan_sentence.raw_text or ""
+                ),
+
+                "exact_score": exact_score,
+                "ngram_score": ngram_score,
+                "tfidf_score": tfidf_score,
+                "semantic_score": semantic_score,
+
+                "scan_sentence": scan_sentence,
+
+                "reference_sentence": (
+                    reference_sentence
+                ),
+            }
+
+            # =================================================
+            # 6. EXACT MATCH HANDLING
+            # =================================================
+            #
+            # Every DISTINCT exact reference is preserved.
+            #
+            # We identify uniqueness by:
+            #
+            #     reference_sentence.id
+            #
+            # Therefore two different reference documents
+            # containing the same text are both retained.
+            # =================================================
+
+            if (
+                exact_score >= 1.0
+                and match_type == "EXACT"
+            ):
+
+                exact_matches_for_sentence = (
+                    exact_sentence_matches.setdefault(
+                        sentence_id,
+                        [],
+                    )
+                )
+
+                # ---------------------------------------------
+                # Prevent duplicate insertion of the same
+                # reference sentence.
+                # ---------------------------------------------
+
+                already_exists = any(
+                    str(
+                        existing_result[
+                            "reference_sentence"
+                        ].id
+                    )
+                    == reference_sentence_id
+                    for existing_result
+                    in exact_matches_for_sentence
+                )
+
+                if not already_exists:
+
+                    exact_matches_for_sentence.append(
+                        sentence_result
+                    )
+
+                # ---------------------------------------------
+                # Exact is the maximum possible score.
+                #
+                # It becomes the ONE scoring result for this
+                # scan sentence.
+                # ---------------------------------------------
+
+                existing_best = (
+                    best_sentence_matches.get(
+                        sentence_id
+                    )
+                )
+
+                if (
+                    existing_best is None
+                    or combined_score
+                    > existing_best[
+                        "combined_score"
+                    ]
+                ):
+
+                    best_sentence_matches[
+                        sentence_id
+                    ] = sentence_result
+
+                continue
+
+            # =================================================
+            # 7. NON-EXACT MATCH HANDLING
+            # =================================================
+            #
+            # Semantic / n-gram / TF-IDF matches:
+            #
+            #     Keep ONLY the strongest candidate.
+            #
+            # This prevents several similar references from
+            # inflating the persisted evidence or score.
+            # =================================================
+
+            existing_best = (
+                best_sentence_matches.get(
+                    sentence_id
+                )
+            )
+
+            if (
+                existing_best is None
+                or combined_score
+                > existing_best[
+                    "combined_score"
+                ]
+            ):
+
+                best_sentence_matches[
+                    sentence_id
+                ] = sentence_result
+
+        # ====================================================
+        # 8. PERSISTENCE DEDUPLICATION
+        # ====================================================
+        #
+        # Database evidence is unique by:
+        #
+        #     scan_sentence_id
+        #     reference_sentence_id
+        #
+        # The same source relationship must never be inserted
+        # twice during one analysis.
+        # ====================================================
+
+        persisted_match_keys: set[
+            tuple[str, str]
+        ] = set()
+
+        # ====================================================
+        # 9. PERSIST ALL DISTINCT EXACT MATCHES
+        # ====================================================
+
+        for (
+            sentence_id,
+            exact_results,
+        ) in exact_sentence_matches.items():
+
+            for result in exact_results:
+
+                scan_sentence = result[
+                    "scan_sentence"
+                ]
+
+                reference_sentence = result[
+                    "reference_sentence"
+                ]
+
+                persistence_key = (
+                    str(scan_sentence.id),
+                    str(reference_sentence.id),
+                )
+
+                # ---------------------------------------------
+                # Defensive duplicate protection
+                # ---------------------------------------------
+
+                if persistence_key in (
+                    persisted_match_keys
+                ):
+                    continue
+
+                # ---------------------------------------------
+                # Persist exact evidence
+                # ---------------------------------------------
+
+                plagiarism_match = PlagiarismMatch(
+                    analysis_id=analysis.id,
+
+                    reference_document_id=(
+                        reference_sentence
+                        .reference_document_id
+                    ),
+
+                    scan_sentence_id=(
+                        scan_sentence.id
+                    ),
+
+                    reference_sentence_id=(
+                        reference_sentence.id
+                    ),
+
+                    detection_method="EXACT",
+
+                    similarity_score=1.0,
+
+                    scan_page_number=(
+                        scan_sentence
+                        .page
+                        .page_number
+                    ),
+
+                    reference_page_number=(
+                        reference_sentence
+                        .page_number
+                    ),
+
+                    scan_text=(
+                        scan_sentence
+                        .raw_text
+                    ),
+
+                    reference_text=(
+                        reference_sentence
+                        .raw_text
+                    ),
+                )
+
+                db.add(
+                    plagiarism_match
+                )
+
+                persisted_match_keys.add(
+                    persistence_key
+                )
+
+        # ====================================================
+        # 10. PERSIST STRONGEST NON-EXACT MATCH
+        # ====================================================
+        #
+        # If the scan sentence already has an exact match,
+        # its non-exact candidates are NOT persisted.
+        #
+        # Example:
+        #
+        #     Ref 1 -> EXACT
+        #     Ref 2 -> HIGH_SIMILARITY
+        #
+        # Persist:
+        #
+        #     Ref 1 -> EXACT
+        #
+        # Do not additionally persist Ref 2.
+        # ====================================================
+
+        for (
+            sentence_id,
+            result,
+        ) in best_sentence_matches.items():
+
+            # ------------------------------------------------
+            # Exact references have already been persisted.
+            # ------------------------------------------------
+
+            if result[
+                "match_type"
+            ] == "EXACT":
+
+                continue
+
+            scan_sentence = result[
+                "scan_sentence"
+            ]
+
+            reference_sentence = result[
+                "reference_sentence"
+            ]
+
+            persistence_key = (
+                str(scan_sentence.id),
+                str(reference_sentence.id),
+            )
+
+            if persistence_key in (
+                persisted_match_keys
+            ):
+                continue
+
+            plagiarism_match = PlagiarismMatch(
+                analysis_id=analysis.id,
+
+                reference_document_id=(
+                    reference_sentence
+                    .reference_document_id
+                ),
+
+                scan_sentence_id=(
+                    scan_sentence.id
+                ),
+
+                reference_sentence_id=(
+                    reference_sentence.id
+                ),
+
+                detection_method=result[
+                    "match_type"
+                ],
+
+                similarity_score=result[
+                    "combined_score"
+                ],
+
+                scan_page_number=(
+                    scan_sentence
+                    .page
+                    .page_number
+                ),
+
+                reference_page_number=(
+                    reference_sentence
+                    .page_number
+                ),
+
+                scan_text=(
+                    scan_sentence
+                    .raw_text
+                ),
+
+                reference_text=(
+                    reference_sentence
+                    .raw_text
+                ),
+            )
+
+            db.add(
+                plagiarism_match
+            )
+
+            persisted_match_keys.add(
+                persistence_key
+            )
+
+        # ====================================================
+        # 11. BUILD UNIQUE SCORING RESULTS
+        # ====================================================
+        #
+        # This is the critical duplicate-score safeguard.
+        #
+        # sentence_results_by_id is keyed ONLY by:
+        #
+        #     scan_sentence_id
+        #
+        # Therefore:
+        #
+        #     Sentence X -> Ref 1
+        #     Sentence X -> Ref 2
+        #
+        # cannot create two scoring records.
+        # ====================================================
+
+        for (
+            sentence_id,
+            result,
+        ) in best_sentence_matches.items():
+
+            sentence_results_by_id[
+                sentence_id
+            ] = {
+                "combined_score": result[
+                    "combined_score"
+                ],
+
+                "match_type": result[
+                    "match_type"
+                ],
+
+                "text_length": result[
+                    "text_length"
+                ],
+
+                "exact_score": result[
+                    "exact_score"
+                ],
+
+                "ngram_score": result[
+                    "ngram_score"
+                ],
+
+                "tfidf_score": result[
+                    "tfidf_score"
+                ],
+
+                "semantic_score": result[
+                    "semantic_score"
+                ],
+            }
+
+        # ====================================================
+        # 12. FINAL SCORING SAFEGUARD
+        # ====================================================
+        #
+        # The number of scoring records can NEVER exceed the
+        # number of scan sentences.
+        # ====================================================
+
+        if (
+            len(sentence_results_by_id)
+            > len(scan_sentences)
+        ):
+
+            raise RuntimeError(
+                "Plagiarism scoring invariant violated: "
+                "number of scoring records exceeds "
+                "number of scan sentences."
+            )
+
+        # ====================================================
+        # 13. CONVERT TO SCORING LIST
+        # ====================================================
+
+        sentence_results = list(
+            sentence_results_by_id.values()
+        )
+
+        # ====================================================
+        # 14. DOCUMENT-LEVEL SCORE
+        # ====================================================
+        #
+        # calculate_document_score() receives:
+        #
+        #     ONE result per scan sentence
+        #
+        # It does NOT receive plagiarism_match rows.
+        #
+        # Therefore duplicate reference documents cannot
+        # inflate overall_similarity.
+        # ====================================================
+
+        document_score = (
+            calculate_document_score(
+                sentence_results
+            )
+        )
+
+        # ====================================================
+        # 15. ALGORITHM-LEVEL SCORES
+        # ====================================================
+        #
+        # These are calculated from unique scan sentences,
+        # NOT from persisted reference rows.
+        # ====================================================
+
+        matched_results = [
+            result
+            for result in sentence_results
+            if result.get(
+                "match_type"
+            )
+            != "NO_SIGNIFICANT_MATCH"
+        ]
+
+        if matched_results:
+
+            analysis.exact_match_score = (
+                sum(
+                    float(
+                        result.get(
+                            "exact_score",
+                            0.0,
+                        )
+                    )
+                    for result in matched_results
+                )
+                / len(matched_results)
+            )
+
+            analysis.ngram_score = (
+                sum(
+                    float(
+                        result.get(
+                            "ngram_score",
+                            0.0,
+                        )
+                    )
+                    for result in matched_results
+                )
+                / len(matched_results)
+            )
+
+            analysis.tfidf_score = (
+                sum(
+                    float(
+                        result.get(
+                            "tfidf_score",
+                            0.0,
+                        )
+                    )
+                    for result in matched_results
+                )
+                / len(matched_results)
+            )
+
+            analysis.semantic_score = (
+                sum(
+                    float(
+                        result.get(
+                            "semantic_score",
+                            0.0,
+                        )
+                    )
+                    for result in matched_results
+                )
+                / len(matched_results)
+            )
+
+        else:
+
+            analysis.exact_match_score = 0.0
+            analysis.ngram_score = 0.0
+            analysis.tfidf_score = 0.0
+            analysis.semantic_score = 0.0
+
+        # ====================================================
+        # 16. OVERALL SIMILARITY
+        # ====================================================
+        #
+        # This represents document-level text coverage.
+        #
+        # Duplicate reference sources do NOT affect it.
+        # ====================================================
+
+        analysis.overall_similarity = (
+            document_score[
+                "document_score"
+            ]
+        )
+
+        # ====================================================
+        # 17. CROSS ENCODER
+        # ====================================================
+
+        analysis.cross_encoder_score = None
+
+        # ====================================================
+        # 18. COMPLETE ANALYSIS
+        # ====================================================
+
+        analysis.status = "COMPLETED"
+
+        analysis.completed_at = (
+            datetime.now(timezone.utc)
+        )
+
+        # ----------------------------------------------------
+        # Flush pending PlagiarismMatch rows and analysis.
+        # ----------------------------------------------------
+
+        db.flush()
+
+        return analysis
+
+    except Exception:
+
+        # ====================================================
+        # ANALYSIS FAILURE
+        # ====================================================
+
+        analysis.status = "FAILED"
+
+        analysis.completed_at = (
+            datetime.now(timezone.utc)
+        )
+
+        db.flush()
+
+        raise
+

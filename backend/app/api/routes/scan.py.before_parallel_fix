@@ -1,0 +1,3159 @@
+import asyncio
+import logging
+
+
+
+from app.db.database import SessionLocal
+from app.models.ai_analysis import AIAnalysisRun
+from app.services.ai_analysis_orchestrator import run_ai_analysis
+from app.services.plagiarism_persistence_service import (
+    save_plagiarism_analysis,
+    ALGORITHM_VERSION,
+)
+
+from __future__ import annotations
+
+
+from fastapi.responses import FileResponse
+
+from app.models.certificate import Certificate
+from app.models.plagiarism import PlagiarismAnalysis
+
+from app.schemas.scan import CertificateResponse
+
+from app.services.certificate_service import (
+    create_certificate,
+)
+from app.services.audit_service import create_audit_log
+
+from collections import defaultdict
+from datetime import datetime, timezone
+import json
+from pathlib import Path
+from uuid import UUID
+from app.services.plagiarism_highlighting_service import (
+    generate_highlighting,
+)
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    UploadFile,
+)
+from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+from app.api.dependencies import (
+    get_current_user,
+    require_roles,
+)
+from app.db.database import get_db
+
+from app.models.scan import (
+    Scan,
+    ScanPage,
+    ScanSection,
+    ScanSentence,
+)
+
+from app.models.plagiarism import (
+    DocumentRequest,
+    PlagiarismAnalysis,
+    PlagiarismMatch,
+)
+
+from app.models.reference import (
+    ReferenceDocument,
+    ReferenceSentence,
+)
+
+from app.models.user import User, UserRole, Role
+
+from app.schemas.scan import (
+    ScanPageResponse,
+    ScanResponse,
+    ScanSentenceResponse,
+
+    PlagiarismStatisticsResponse,
+    PlagiarismAlgorithmScoresResponse,
+    PlagiarismMatchCountsResponse,
+    PlagiarismMatchResponse,
+    PlagiarismResultResponse,
+    UnmatchedSentenceResponse,
+
+    PlagiarismSourceSummaryResponse,
+    PlagiarismPageSummaryResponse,
+    PlagiarismReportResponse,
+     PlagiarismCompareResponse,
+    CompareReferenceDocumentResponse,
+    CompareMatchResponse,
+    CertificateGenerationRequest,
+)
+
+from app.services.audit_service import create_audit_log
+
+from app.services.scan_service import (
+    process_extracted_pages,
+    process_page_sentences,
+    save_scan_file,
+)
+from app.services.selective_scan_service import (
+    extract_selectable_paragraphs,
+)
+
+from app.services.plagiarism_persistence_service import (
+    save_plagiarism_analysis,
+)
+from sqlalchemy import func
+from sqlalchemy.orm import Session
+# ============================================================
+# ROUTER
+# ============================================================
+
+router = APIRouter(
+    prefix="/scans",
+    tags=["Scans"],
+)
+logger = logging.getLogger(__name__)
+
+# ============================================================
+# HELPER FUNCTIONS
+# ============================================================
+
+def get_user_roles(
+    db: Session,
+    user: User,
+) -> list[str]:
+    """
+    Return role names assigned to the user.
+    """
+
+    user_roles = (
+        db.query(UserRole)
+        .filter(
+            UserRole.user_id == user.id
+        )
+        .all()
+    )
+
+    return [
+        user_role.role.role_name
+        for user_role in user_roles
+        if user_role.role is not None
+    ]
+
+def can_access_scan(
+    db: Session,
+    scan: Scan,
+    current_user: User,
+) -> bool:
+    """
+    Admins can access all scans.
+    Instructors and Student Officers can access only their own scans.
+    Other roles cannot access scans.
+    """
+
+    roles = get_user_roles(
+        db=db,
+        user=current_user,
+    )
+
+    if "ADMIN" in roles:
+        return True
+
+    if not (
+        {"INSTRUCTOR", "STUDENT_OFFICER"}
+        & set(roles)
+    ):
+        return False
+
+    # Prefer owner_id; use scanned_by for legacy scans
+    # that do not have an owner_id.
+    owner_id = scan.owner_id or scan.scanned_by
+
+    return owner_id == current_user.id
+def build_scan_response(
+    scan: Scan,
+) -> ScanResponse:
+    """
+    Convert Scan database object into ScanResponse.
+    """
+
+    return ScanResponse(
+        id=str(scan.id),
+        title=scan.title,
+        file_name=scan.file_name,
+        file_size=scan.file_size,
+        mime_type=scan.mime_type,
+        sha256_hash=scan.sha256_hash,
+        status=scan.status,
+        owner_id=(
+            str(scan.owner_id)
+            if scan.owner_id
+            else None
+        ),
+        scanned_by=str(scan.scanned_by),
+        created_at=scan.created_at.isoformat(),
+        completed_at=(
+            scan.completed_at.isoformat()
+            if scan.completed_at
+            else None
+        ),
+    )
+
+
+# ============================================================
+# LIST SCANS
+# ============================================================
+
+
+@router.get("")
+def list_scans(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """List scans visible to the logged-in user."""
+    roles = get_user_roles(db=db, user=current_user)
+
+    query = db.query(Scan)
+
+    if "ADMIN" not in roles:
+        if not ({"INSTRUCTOR", "STUDENT_OFFICER"} & set(roles)):
+            raise HTTPException(
+                status_code=403,
+                detail="You do not have permission to view scans.",
+            )
+
+        query = query.filter(
+            (Scan.owner_id == current_user.id)
+            | (
+                Scan.owner_id.is_(None)
+                & (Scan.scanned_by == current_user.id)
+            )
+        )
+
+    scans = query.order_by(Scan.created_at.desc()).all()
+    results = []
+    titles = {scan.title for scan in scans if scan.title}
+    request_status_by_title: dict[str, str] = {}
+    request_status_by_scan_id: dict[str, str] = {}
+
+    if titles:
+        instructor_user_ids = (
+            db.query(UserRole.user_id)
+            .join(Role, Role.id == UserRole.role_id)
+            .filter(Role.role_name == "INSTRUCTOR")
+        )
+        requests = (
+            db.query(DocumentRequest)
+            .filter(
+                DocumentRequest.request_type == "ADD",
+                DocumentRequest.title.in_(titles),
+                DocumentRequest.requested_by.in_(instructor_user_ids),
+            )
+            .order_by(
+                DocumentRequest.created_at.desc(),
+                DocumentRequest.id.desc(),
+            )
+            .all()
+        )
+        for request in requests:
+            request_status_by_title.setdefault(
+                request.title,
+                request.status,
+            )
+            if request.scan_id:
+                request_status_by_scan_id.setdefault(
+                    str(request.scan_id),
+                    request.status,
+                )
+
+    for scan in scans:
+        item = build_scan_response(scan).dict()
+        item["reference_request_status"] = (
+            request_status_by_scan_id.get(str(scan.id))
+            or request_status_by_title.get(scan.title)
+        )
+
+        # Certificate information
+        certificate = (
+            db.query(Certificate)
+            .filter(Certificate.scan_id == scan.id)
+            .first()
+        )
+
+        item["certificate_generated"] = certificate is not None
+        item["certificate_number"] = (
+            certificate.certificate_number if certificate else None
+        )
+        item["certificate_id"] = (
+            str(certificate.id) if certificate else None
+        )
+
+        # Approval fields are not yet connected to an identified
+        # approval record in the database.
+        item["approval_status"] = scan.approval_status
+        item["admin_approval_date"] = (
+            scan.admin_approval_date.isoformat()
+            if scan.admin_approval_date
+            else None
+        )
+        item["reviewed_by"] = (
+            str(scan.reviewed_by)
+            if scan.reviewed_by
+            else None
+        )
+        item["admin_comments"] = scan.admin_comments
+
+        # Latest plagiarism analysis
+        analysis = (
+            db.query(PlagiarismAnalysis)
+            .filter(PlagiarismAnalysis.scan_id == scan.id)
+            .order_by(
+                PlagiarismAnalysis.created_at.desc(),
+                PlagiarismAnalysis.id.desc(),
+            )
+            .first()
+        )
+
+        similarity = (
+            float(analysis.overall_similarity)
+            if analysis and analysis.overall_similarity is not None
+            else None
+        )
+
+        # The UI expects a percentage. Convert fractional scores
+        # such as 0.25 to 25, but preserve scores already in 0–100.
+        if similarity is not None and 0 <= similarity <= 1:
+            similarity *= 100
+
+        item["plagiarism_score"] = similarity
+        item["ai_score"] = None
+
+        results.append(item)
+
+    return results
+
+
+# ============================================================
+# CREATE SCAN
+# ============================================================
+
+@router.post("/preview")
+async def preview_scan_document(
+    document: UploadFile = File(...),
+    current_user: User = Depends(
+        require_roles("ADMIN", "INSTRUCTOR")
+    ),
+):
+    file_path: Path | None = None
+    try:
+        file_path, _, _, _ = await save_scan_file(document)
+        pages = process_extracted_pages(file_path)
+        selection = extract_selectable_paragraphs(pages)
+        if not selection["paragraphs"]:
+            raise HTTPException(
+                status_code=422,
+                detail="No selectable paragraphs were found in this document.",
+            )
+        return {
+            "paragraphs": selection["paragraphs"],
+            "default_selected_ids": selection["default_selected_ids"],
+            "is_fter": selection["is_fter"],
+        }
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to preview uploaded document: {exc}",
+        ) from exc
+    finally:
+        if file_path is not None:
+            file_path.unlink(missing_ok=True)
+def run_plagiarism_in_isolated_session(
+    scan_id: UUID,
+    initiated_by: UUID,
+) -> str:
+    db = SessionLocal()
+
+    try:
+        analysis = save_plagiarism_analysis(
+            db=db,
+            scan_id=scan_id,
+            initiated_by=initiated_by,
+        )
+
+        db.commit()
+
+        return analysis.status
+
+    except Exception:
+        logger.exception(
+            "Plagiarism analysis failed for scan %s",
+            scan_id,
+        )
+
+        db.rollback()
+        db.close()
+
+        # Persist FAILED independently because the original
+        # transaction was rolled back.
+        failure_db = SessionLocal()
+
+        try:
+            failed_analysis = PlagiarismAnalysis(
+                scan_id=scan_id,
+                initiated_by=initiated_by,
+                status="FAILED",
+                algorithm_version=ALGORITHM_VERSION,
+                completed_at=datetime.now(timezone.utc),
+            )
+
+            failure_db.add(failed_analysis)
+            failure_db.commit()
+
+        except Exception:
+            failure_db.rollback()
+            logger.exception(
+                "Could not persist plagiarism failure for scan %s",
+                scan_id,
+            )
+
+        finally:
+            failure_db.close()
+
+        return "FAILED"
+
+    finally:
+        db.close()
+
+@router.post(
+    "",
+    response_model=ScanResponse,
+)
+async def create_scan(
+    title: str = Form(...),
+    document: UploadFile = File(...),
+    destination_folder: str = Form(""),
+    scan_mode: str = Form("complete"),
+    selected_paragraph_ids: str | None = Form(None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(
+        require_roles(
+            "ADMIN",
+            "INSTRUCTOR",
+        )
+    ),
+):
+    """
+    Upload a document, extract its contents,
+    create scan sentences and run plagiarism analysis.
+    """
+    if scan_mode not in {"complete", "selective"}:
+        raise HTTPException(
+            status_code=400,
+            detail="Scan mode must be 'complete' or 'selective'.",
+        )
+    requested_paragraph_ids: list[str] | None = None
+    if selected_paragraph_ids is not None:
+        try:
+            parsed_ids = json.loads(selected_paragraph_ids)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail="Selected paragraph IDs must be a JSON array.",
+            ) from exc
+        if (
+            not isinstance(parsed_ids, list)
+            or any(not isinstance(item, str) or not item for item in parsed_ids)
+            or len(parsed_ids) != len(set(parsed_ids))
+            or not parsed_ids
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Select at least one valid paragraph.",
+            )
+        requested_paragraph_ids = parsed_ids
+    if scan_mode == "selective" and requested_paragraph_ids is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Choose the report paragraphs to scan.",
+        )
+
+    # --------------------------------------------------------
+    # Save uploaded file
+    # --------------------------------------------------------
+
+    try:
+        (
+            file_path,
+            file_size,
+            sha256_hash,
+            extension,
+        ) = await save_scan_file(
+                document,
+                destination_folder=destination_folder,
+            )
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        )
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to save uploaded document: {exc}",
+        )
+
+    # --------------------------------------------------------
+    # Determine MIME type
+    # --------------------------------------------------------
+
+    mime_type = (
+        document.content_type
+        or "application/octet-stream"
+    )
+
+    # --------------------------------------------------------
+    # Create Scan record
+    # --------------------------------------------------------
+
+    scan = Scan(
+        title=title,
+        file_name=document.filename or f"document{extension}",
+        file_path=str(file_path),
+        file_size=file_size,
+        mime_type=mime_type,
+        sha256_hash=sha256_hash,
+        status="PROCESSING",
+        owner_id=current_user.id,
+        scanned_by=current_user.id,
+    )
+
+    db.add(scan)
+
+    try:
+        db.flush()
+
+        # ----------------------------------------------------
+        # Extract document pages
+        # ----------------------------------------------------
+
+        processed_pages = process_extracted_pages(
+            file_path
+        )
+        selection = extract_selectable_paragraphs(processed_pages)
+        if not selection["paragraphs"]:
+            raise HTTPException(
+                status_code=422,
+                detail="No body paragraphs were found in this document.",
+            )
+        available_ids = {
+            paragraph["id"] for paragraph in selection["paragraphs"]
+        }
+        if requested_paragraph_ids is not None:
+            unknown_ids = set(requested_paragraph_ids) - available_ids
+            if unknown_ids:
+                raise HTTPException(
+                    status_code=400,
+                    detail="The selected paragraphs do not match this document preview. Preview the document again.",
+                )
+
+        selected_ids = (
+            set(requested_paragraph_ids)
+            if scan_mode == "selective" and requested_paragraph_ids is not None
+            else {
+                paragraph["id"]
+                for paragraph in selection["paragraphs"]
+                if not paragraph.get("is_front_matter", False)
+            }
+        )
+        selected_paragraphs = [
+            paragraph
+            for paragraph in selection["paragraphs"]
+            if paragraph["id"] in selected_ids
+        ]
+
+        section_by_group: dict[str, ScanSection] = {}
+        leaf_section_by_paragraph: dict[str, ScanSection] = {}
+        for section_order, paragraph in enumerate(selected_paragraphs, start=1):
+            group_id = paragraph.get("parent_section_id") or paragraph["section_id"]
+            group_title = (
+                paragraph.get("parent_section_title")
+                or paragraph["section_title"]
+            )
+            if group_id not in section_by_group:
+                section = ScanSection(
+                    scan_id=scan.id,
+                    section_title=group_title,
+                    normalized_title=group_title.casefold(),
+                    section_level=1,
+                    section_order=section_order,
+                    page_start=paragraph["page_number"],
+                    page_end=paragraph["page_number"],
+                )
+                db.add(section)
+                db.flush()
+                section_by_group[group_id] = section
+
+            parent = section_by_group[group_id]
+            parent.page_end = max(
+                parent.page_end or paragraph["page_number"],
+                paragraph["page_number"],
+            )
+            leaf = ScanSection(
+                scan_id=scan.id,
+                parent_section_id=parent.id,
+                section_title=paragraph["label"],
+                normalized_title=paragraph["label"].casefold(),
+                section_level=2,
+                section_order=section_order,
+                page_start=paragraph["page_number"],
+                page_end=paragraph["page_number"],
+            )
+            db.add(leaf)
+            db.flush()
+            leaf_section_by_paragraph[paragraph["id"]] = leaf
+
+        paragraphs_by_page: defaultdict[int, list[dict]] = defaultdict(list)
+        for paragraph in selected_paragraphs:
+            paragraphs_by_page[int(paragraph["page_number"])].append(paragraph)
+
+        # ----------------------------------------------------
+        # Create pages and sentences
+        # ----------------------------------------------------
+
+        for processed_page in processed_pages:
+
+            scan_page = ScanPage(
+                scan_id=scan.id,
+                page_number=processed_page[
+                    "page_number"
+                ],
+                raw_text=processed_page[
+                    "raw_text"
+                ],
+                #normalized_text=processed_page[
+                   # "normalized_text"
+                #],
+            )
+
+            db.add(scan_page)
+
+            db.flush()
+
+            # ------------------------------------------------
+            # Process sentences on this page
+            # ------------------------------------------------
+
+            sentence_index = 0
+            for paragraph in paragraphs_by_page.get(
+                int(processed_page["page_number"]),
+                [],
+            ):
+                for sentence_data in process_page_sentences(paragraph["text"]):
+                    sentence_index += 1
+                    db.add(
+                        ScanSentence(
+                            scan_id=scan.id,
+                            page_id=scan_page.id,
+                            section_id=leaf_section_by_paragraph[
+                                paragraph["id"]
+                            ].id,
+                            sentence_index=sentence_index,
+                            raw_text=sentence_data["raw_text"],
+                            normalized_text=sentence_data["normalized_text"],
+                            token_count=sentence_data["token_count"],
+                        )
+                    )
+
+        db.flush()
+
+        # ----------------------------------------------------
+        # Run plagiarism analysis
+        # ----------------------------------------------------
+
+        # ----------------------------------------------------
+        # Mark scan completed
+        # ----------------------------------------------------
+
+        scan.status = "COMPLETED"
+
+        scan.completed_at = datetime.now(
+            timezone.utc
+        )
+
+        # ----------------------------------------------------
+        # Audit log
+        # ----------------------------------------------------
+
+        create_audit_log(
+            db=db,
+            user_id=current_user.id,
+            action="SCAN_CREATED",
+            entity_type="SCAN",
+            entity_id=scan.id,
+            new_values={
+                "title": scan.title,
+                "file_name": scan.file_name,
+            },
+        )
+
+        # ----------------------------------------------------
+        # Commit transaction
+        # ----------------------------------------------------
+
+        db.commit()
+
+        db.refresh(scan)
+
+        # ----------------------------------------------------
+# Automatically run both analyses concurrently
+# ----------------------------------------------------
+
+        plagiarism_status, ai_status = await asyncio.gather(
+            asyncio.to_thread(
+                run_plagiarism_in_isolated_session,
+                scan.id,
+                current_user.id,
+            ),
+            asyncio.to_thread(
+                run_ai_detection_in_isolated_session,
+                scan.id,
+                current_user.id,
+            ),
+        )
+
+        logger.info(
+            "Scan %s analysis results: plagiarism=%s, ai=%s",
+            scan.id,
+            plagiarism_status,
+            ai_status,
+        )
+
+        return build_scan_response(scan)
+        
+
+    except HTTPException:
+        db.rollback()
+
+        if Path(file_path).exists():
+            Path(file_path).unlink()
+
+        raise
+
+    except Exception as exc:
+
+        db.rollback()
+
+        # ----------------------------------------------------
+        # Delete uploaded file if processing failed
+        # ----------------------------------------------------
+
+        try:
+            if Path(file_path).exists():
+                Path(file_path).unlink()
+        except Exception:
+            pass
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to process scan: {exc}",
+        )
+
+
+# ============================================================
+# VIEW ORIGINAL SCANNED DOCUMENT
+# ============================================================
+
+@router.get("/{scan_id}/document")
+def view_scan_document(
+    scan_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(
+        require_roles("ADMIN", "INSTRUCTOR")
+    ),
+):
+    """Serve the original uploaded PDF inline."""
+
+    scan = (
+        db.query(Scan)
+        .filter(Scan.id == scan_id)
+        .first()
+    )
+
+    
+    if scan is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Scan not found.",
+        )
+
+    if not can_access_scan(
+        db=db,
+        scan=scan,
+        current_user=current_user,
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="You do not have permission to access this scan.",
+        )
+
+    file_path = Path(scan.file_path).resolve()
+
+
+    if not file_path.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail="Original document file not found.",
+        )
+
+    if file_path.suffix.lower() != ".pdf":
+        raise HTTPException(
+            status_code=415,
+            detail="Inline document viewing is supported for PDF files only.",
+        )
+
+    return FileResponse(
+        path=str(file_path),
+        media_type="application/pdf",
+        content_disposition_type="inline",
+        headers={
+            "X-Content-Type-Options": "nosniff",
+            "Cache-Control": "private, no-store",
+        },
+    )
+
+# ============================================================
+# VIEW ORIGINAL SCANNED PDF
+# ============================================================
+
+@router.get("/{scan_id}/document")
+def view_scan_document(
+    scan_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(
+        require_roles("ADMIN", "INSTRUCTOR")
+    ),
+):
+    """Serve the original uploaded PDF for authenticated viewing."""
+
+    scan = (
+        db.query(Scan)
+        .filter(Scan.id == scan_id)
+        .first()
+    )
+
+    
+    if scan is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Scan not found.",
+        )
+
+    if not can_access_scan(
+        db=db,
+        scan=scan,
+        current_user=current_user,
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="You do not have permission to access this scan.",
+        )
+
+    file_path = Path(scan.file_path).resolve()
+
+
+
+    if not file_path.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail="Original document file not found.",
+        )
+
+    if file_path.suffix.lower() != ".pdf":
+        raise HTTPException(
+            status_code=415,
+            detail="Inline viewing is supported for PDF files only.",
+        )
+
+    return FileResponse(
+        path=str(file_path),
+        media_type="application/pdf",
+        content_disposition_type="inline",
+        headers={
+            "X-Content-Type-Options": "nosniff",
+            "Cache-Control": "private, no-store",
+        },
+    )
+
+# ============================================================
+# GET EXTRACTED DOCUMENT PAGES FOR UNIFIED PREVIEW
+# ============================================================
+
+@router.get("/{scan_id}/pages")
+def get_scan_document_pages(
+    scan_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(
+        require_roles("ADMIN", "INSTRUCTOR")
+    ),
+):
+    """Return the extracted text of every page in a scan."""
+
+    scan = (
+        db.query(Scan)
+        .filter(Scan.id == scan_id)
+        .first()
+    )
+
+    if scan is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Scan not found.",
+        )
+
+    if not can_access_scan(
+        db=db,
+        scan=scan,
+        current_user=current_user,
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="You do not have permission to access this scan.",
+        )
+
+    pages = (
+        db.query(ScanPage)
+        .filter(ScanPage.scan_id == scan.id)
+        .order_by(ScanPage.page_number.asc())
+        .all()
+    )
+    page_data = [
+        {
+            "page_number": page.page_number,
+            "raw_text": page.raw_text,
+        }
+        for page in pages
+    ]
+    if not any(item["raw_text"].strip() for item in page_data):
+        source_path = Path(scan.file_path)
+        if not source_path.is_file():
+            raise HTTPException(
+                status_code=404,
+                detail="Extracted pages are missing and the original scan file is unavailable.",
+            )
+        try:
+            extracted_pages = process_extracted_pages(source_path)
+        except (OSError, ValueError) as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Could not re-extract text from the original scan file: {exc}",
+            ) from exc
+        page_data = [
+            {
+                "page_number": page["page_number"],
+                "raw_text": page["raw_text"],
+            }
+            for page in extracted_pages
+        ]
+        if not any(item["raw_text"].strip() for item in page_data):
+            raise HTTPException(
+                status_code=422,
+                detail="No extractable text was found in the original scan file.",
+            )
+
+    return {
+        "scan_id": str(scan.id),
+        "pages": page_data,
+    }
+
+# ============================================================
+# GET PLAGIARISM RESULT
+# ============================================================
+def run_ai_detection_in_isolated_session(
+    scan_id: UUID,
+    initiated_by: UUID,
+) -> str:
+    db = SessionLocal()
+
+    try:
+        analysis_run = run_ai_analysis(
+            db=db,
+            scan_id=scan_id,
+            initiated_by=initiated_by,
+        )
+
+        status = analysis_run.status
+
+        db.commit()
+
+        return status
+
+    except Exception:
+        logger.exception(
+            "AI detection failed for scan %s",
+            scan_id,
+        )
+
+        db.rollback()
+        db.close()
+
+        # Persist the failed run in a fresh transaction.
+        failure_db = SessionLocal()
+
+        try:
+            failed_run = AIAnalysisRun(
+                scan_id=scan_id,
+                initiated_by=initiated_by,
+                status="FAILED",
+                completed_at=datetime.now(timezone.utc),
+            )
+
+            failure_db.add(failed_run)
+            failure_db.commit()
+
+        except Exception:
+            failure_db.rollback()
+            logger.exception(
+                "Could not persist AI detection failure for scan %s",
+                scan_id,
+            )
+
+        finally:
+            failure_db.close()
+
+        return "FAILED"
+
+    finally:
+        db.close()
+@router.get(
+    "/{scan_id}/plagiarism",
+    response_model=PlagiarismResultResponse,
+)
+def get_plagiarism_result(
+    scan_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(
+        require_roles(
+            "ADMIN",
+            "INSTRUCTOR",
+        )
+    ),
+):
+    """
+    Return the plagiarism result for a scan.
+    """
+
+    # --------------------------------------------------------
+    # Find scan
+    # --------------------------------------------------------
+
+    scan = (
+        db.query(Scan)
+        .filter(
+            Scan.id == scan_id
+        )
+        .first()
+    )
+
+    if not scan:
+        raise HTTPException(
+            status_code=404,
+            detail="Scan not found.",
+        )
+
+    # --------------------------------------------------------
+    # Access check
+    # --------------------------------------------------------
+
+    if not can_access_scan(
+        db,
+        scan,
+        current_user,
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="You do not have permission to access this scan.",
+        )
+
+    # --------------------------------------------------------
+    # Find latest analysis
+    # --------------------------------------------------------
+
+    analysis = (
+        db.query(PlagiarismAnalysis)
+        .filter(
+            PlagiarismAnalysis.scan_id == scan.id
+        )
+        .order_by(
+            PlagiarismAnalysis.created_at.desc()
+        )
+        .first()
+    )
+
+    if not analysis:
+        raise HTTPException(
+            status_code=404,
+            detail="Plagiarism analysis not found.",
+        )
+
+    # --------------------------------------------------------
+    # Load all scan sentences
+    # --------------------------------------------------------
+
+    sentences = (
+        db.query(ScanSentence)
+        .filter(
+            ScanSentence.scan_id == scan.id
+        )
+        .order_by(
+            ScanSentence.sentence_index
+        )
+        .all()
+    )
+
+    # --------------------------------------------------------
+    # Load plagiarism matches
+    # --------------------------------------------------------
+
+    match_rows = (
+        db.query(
+            PlagiarismMatch,
+            ScanSentence,
+            ReferenceDocument,
+        )
+        .join(
+            ScanSentence,
+            ScanSentence.id
+            == PlagiarismMatch.scan_sentence_id,
+        )
+        .join(
+            ReferenceDocument,
+            ReferenceDocument.id
+            == PlagiarismMatch.reference_document_id,
+        )
+        .filter(
+            PlagiarismMatch.analysis_id
+            == analysis.id
+        )
+        .all()
+    )
+
+    # --------------------------------------------------------
+    # Build match response
+    # --------------------------------------------------------
+
+    matches = []
+
+    for (
+        match,
+        sentence,
+        reference_document,
+    ) in match_rows:
+
+        matches.append(
+            PlagiarismMatchResponse(
+                id=str(match.id),
+                sentence_index=sentence.sentence_index,
+                scan_page_number=match.scan_page_number,
+                match_type=(
+                    match.detection_method
+                    or "UNKNOWN"
+                ),
+                similarity_score=float(
+                    match.similarity_score
+                ),
+                source=reference_document.title,
+                reference_page_number=(
+                    match.reference_page_number
+                ),
+                scan_text=match.scan_text,
+                reference_text=match.reference_text,
+            )
+        )
+
+    # --------------------------------------------------------
+    # Unique matched sentences
+    # --------------------------------------------------------
+
+    matched_sentence_ids = {
+        match.scan_sentence_id
+        for match, _, _ in match_rows
+    }
+
+    matched_sentences = [
+        sentence
+        for sentence in sentences
+        if sentence.id in matched_sentence_ids
+    ]
+
+    # --------------------------------------------------------
+    # Unmatched sentences
+    # --------------------------------------------------------
+
+    unmatched_sentences = [
+        UnmatchedSentenceResponse(
+            sentence_index=sentence.sentence_index,
+            scan_page_number=(
+                sentence.page.page_number
+                if sentence.page
+                else None
+            ),
+            text=sentence.raw_text,
+            token_count=sentence.token_count,
+        )
+        for sentence in sentences
+        if sentence.id not in matched_sentence_ids
+    ]
+
+    # --------------------------------------------------------
+    # Sentence statistics
+    # --------------------------------------------------------
+
+    total_sentence_count = len(
+        sentences
+    )
+
+    matched_sentence_count = len(
+        matched_sentences
+    )
+
+    unmatched_sentence_count = (
+        total_sentence_count
+        - matched_sentence_count
+    )
+
+    if total_sentence_count:
+        sentence_coverage = (
+            matched_sentence_count
+            / total_sentence_count
+        ) * 100
+    else:
+        sentence_coverage = 0.0
+
+    # --------------------------------------------------------
+    # Text coverage
+    # --------------------------------------------------------
+
+    total_text_length = sum(
+        len(sentence.raw_text or "")
+        for sentence in sentences
+    )
+
+    matched_text_length = sum(
+        len(sentence.raw_text or "")
+        for sentence in matched_sentences
+    )
+
+    if total_text_length:
+        text_coverage = (
+            matched_text_length
+            / total_text_length
+        ) * 100
+    else:
+        text_coverage = 0.0
+
+    # --------------------------------------------------------
+    # Best match score per sentence
+    # --------------------------------------------------------
+
+    best_match_by_sentence = {}
+
+    for (
+        match,
+        sentence,
+        _,
+    ) in match_rows:
+
+        score = float(
+            match.similarity_score
+        )
+
+        existing = best_match_by_sentence.get(
+            sentence.id
+        )
+
+        if (
+            existing is None
+            or score > existing
+        ):
+            best_match_by_sentence[
+                sentence.id
+            ] = score
+
+    if best_match_by_sentence:
+
+        average_match_strength = (
+            sum(
+                best_match_by_sentence.values()
+            )
+            / len(best_match_by_sentence)
+        )
+
+    else:
+
+        average_match_strength = 0.0
+
+    # --------------------------------------------------------
+    # Match classification per sentence
+    # --------------------------------------------------------
+
+    best_type_by_sentence = {}
+
+    priority = {
+        "EXACT": 4,
+        "STRONG_TEXTUAL_MATCH": 3,
+        "HIGH_SIMILARITY": 2,
+        "MODERATE_SIMILARITY": 1,
+        "LOW_SIMILARITY": 0,
+    }
+
+    for (
+        match,
+        sentence,
+        _,
+    ) in match_rows:
+
+        match_type = (
+            match.detection_method
+            or "LOW_SIMILARITY"
+        )
+
+        existing = best_type_by_sentence.get(
+            sentence.id
+        )
+
+        if (
+            existing is None
+            or priority.get(
+                match_type,
+                0,
+            )
+            > priority.get(
+                existing,
+                0,
+            )
+        ):
+
+            best_type_by_sentence[
+                sentence.id
+            ] = match_type
+
+    # --------------------------------------------------------
+    # Match counts
+    # --------------------------------------------------------
+
+    exact_count = sum(
+        1
+        for match_type
+        in best_type_by_sentence.values()
+        if match_type == "EXACT"
+    )
+
+    high_similarity_count = sum(
+        1
+        for match_type
+        in best_type_by_sentence.values()
+        if match_type == "HIGH_SIMILARITY"
+    )
+
+    moderate_similarity_count = sum(
+        1
+        for match_type
+        in best_type_by_sentence.values()
+        if match_type == "MODERATE_SIMILARITY"
+    )
+
+    low_similarity_count = sum(
+        1
+        for match_type
+        in best_type_by_sentence.values()
+        if match_type == "LOW_SIMILARITY"
+    )
+
+    # --------------------------------------------------------
+    # Statistics response
+    # --------------------------------------------------------
+
+    statistics = (
+        PlagiarismStatisticsResponse(
+            total_sentences=total_sentence_count,
+            matched_sentences=matched_sentence_count,
+            unmatched_sentences=unmatched_sentence_count,
+            sentence_coverage_percentage=round(
+                sentence_coverage,
+                2,
+            ),
+            text_coverage_percentage=round(
+                text_coverage,
+                2,
+            ),
+            average_match_strength=round(
+                average_match_strength,
+                2,
+            ),
+        )
+    )
+
+    # --------------------------------------------------------
+    # Algorithm scores
+    # --------------------------------------------------------
+
+    algorithm_scores = (
+        PlagiarismAlgorithmScoresResponse(
+            exact=(
+                float(
+                    analysis.exact_match_score
+                )
+                if analysis.exact_match_score
+                is not None
+                else None
+            ),
+            ngram=(
+                float(
+                    analysis.ngram_score
+                )
+                if analysis.ngram_score
+                is not None
+                else None
+            ),
+            tfidf=(
+                float(
+                    analysis.tfidf_score
+                )
+                if analysis.tfidf_score
+                is not None
+                else None
+            ),
+            semantic=(
+                float(
+                    analysis.semantic_score
+                )
+                if analysis.semantic_score
+                is not None
+                else None
+            ),
+            cross_encoder=(
+                float(
+                    analysis.cross_encoder_score
+                )
+                if analysis.cross_encoder_score
+                is not None
+                else None
+            ),
+        )
+    )
+
+    # --------------------------------------------------------
+    # Match counts response
+    # --------------------------------------------------------
+
+    match_counts = (
+        PlagiarismMatchCountsResponse(
+            exact=exact_count,
+            high_similarity=high_similarity_count,
+            moderate_similarity=moderate_similarity_count,
+            low_similarity=low_similarity_count,
+        )
+    )
+
+    # --------------------------------------------------------
+    # Return result
+    # --------------------------------------------------------
+
+    return PlagiarismResultResponse(
+        scan_id=str(scan.id),
+        analysis_id=str(analysis.id),
+        status=analysis.status,
+        overall_similarity=(
+            float(
+                analysis.overall_similarity
+            )
+            if analysis.overall_similarity
+            is not None
+            else None
+        ),
+        statistics=statistics,
+        algorithm_scores=algorithm_scores,
+        match_counts=match_counts,
+        matches=matches,
+        unmatched_sentences=unmatched_sentences,
+    )
+
+
+# ============================================================
+# GET COMPLETE PLAGIARISM REPORT
+# ============================================================
+
+@router.get(
+    "/{scan_id}/plagiarism/report",
+    response_model=PlagiarismReportResponse,
+)
+def get_plagiarism_report(
+    scan_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    # ========================================================
+    # VALIDATE SCAN ID
+    # ========================================================
+
+    try:
+        scan_uuid = UUID(scan_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid scan_id.",
+        )
+
+    # ========================================================
+    # FIND SCAN
+    # ========================================================
+
+    scan = (
+        db.query(Scan)
+        .filter(Scan.id == scan_uuid)
+        .first()
+    )
+
+    if not scan:
+        raise HTTPException(
+            status_code=404,
+            detail="Scan not found.",
+        )
+
+    # ========================================================
+    # CHECK ACCESS
+    # ========================================================
+
+    if not can_access_scan(
+        db=db,
+        scan=scan,
+        current_user=current_user,
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="You do not have access to this scan.",
+        )
+
+    # ========================================================
+    # FIND COMPLETED PLAGIARISM ANALYSIS
+    # ========================================================
+
+    analysis = (
+        db.query(PlagiarismAnalysis)
+        .filter(
+            PlagiarismAnalysis.scan_id == scan.id
+        )
+        .order_by(
+            ScanPage.page_number.asc(),
+            PlagiarismAnalysis.created_at.desc()
+        )
+        .first()
+    )
+
+    if not analysis:
+        raise HTTPException(
+            status_code=404,
+            detail="Plagiarism analysis not found.",
+        )
+
+    # ========================================================
+    # LOAD SCAN SENTENCES
+    # ========================================================
+
+    scan_sentences = (
+        db.query(ScanSentence)
+        .options(
+            joinedload(ScanSentence.page)
+        )
+        .filter(
+            ScanSentence.scan_id == scan.id
+        )
+        .order_by(
+            ScanPage.page_number.asc(),
+            ScanSentence.sentence_index.asc()
+        )
+        .all()
+    )
+
+    # ========================================================
+    # LOAD MATCHES
+    # ========================================================
+
+    matches = (
+        db.query(PlagiarismMatch)
+        .options(
+            joinedload(
+                PlagiarismMatch.reference_sentence
+            ).joinedload(
+                ReferenceSentence.reference_document
+            ),
+            joinedload(
+                PlagiarismMatch.scan_sentence
+            ).joinedload(
+                ScanSentence.page
+            ),
+        )
+        .filter(
+            PlagiarismMatch.analysis_id
+            == analysis.id
+        )
+        .order_by(
+            PlagiarismMatch.created_at.asc()
+        )
+        .all()
+    )
+
+    # ========================================================
+    # GROUP MATCHES BY SCAN SENTENCE
+    # ========================================================
+
+    matches_by_sentence: dict[
+        UUID,
+        list[PlagiarismMatch]
+    ] = {}
+
+    for match in matches:
+        matches_by_sentence.setdefault(
+            match.scan_sentence_id,
+            [],
+        ).append(match)
+
+    # ========================================================
+    # SENTENCE STATISTICS
+    # ========================================================
+
+    total_sentences = len(scan_sentences)
+
+    matched_sentence_ids = set(
+        matches_by_sentence.keys()
+    )
+
+    matched_sentences = len(
+        matched_sentence_ids
+    )
+
+    unmatched_sentences = (
+        total_sentences
+        - matched_sentences
+    )
+
+    sentence_coverage_percentage = (
+        (
+            matched_sentences
+            / total_sentences
+        )
+        * 100
+        if total_sentences
+        else 0.0
+    )
+
+    # ========================================================
+    # TEXT COVERAGE
+    #
+    # Only sentences with actual persisted matches
+    # contribute to matched text.
+    # ========================================================
+
+    total_text_length = sum(
+        len(sentence.raw_text or "")
+        for sentence in scan_sentences
+    )
+
+    matched_text_length = sum(
+        len(
+            scan_sentence.raw_text
+            or ""
+        )
+        for scan_sentence in scan_sentences
+        if scan_sentence.id
+        in matched_sentence_ids
+    )
+
+    text_coverage_percentage = (
+        (
+            matched_text_length
+            / total_text_length
+        )
+        * 100
+        if total_text_length
+        else 0.0
+    )
+
+    # ========================================================
+    # MATCH STRENGTH
+    # ========================================================
+
+    match_strength_values = [
+        float(match.similarity_score)
+        for match in matches
+        if match.similarity_score is not None
+    ]
+
+    average_match_strength = (
+        sum(match_strength_values)
+        / len(match_strength_values)
+        if match_strength_values
+        else 0.0
+    )
+
+    # ========================================================
+    # MATCH COUNTS
+    # ========================================================
+
+    exact_count = sum(
+        1
+        for match in matches
+        if match.detection_method == "EXACT"
+    )
+
+    high_similarity_count = sum(
+        1
+        for match in matches
+        if match.detection_method
+        == "HIGH_SIMILARITY"
+    )
+
+    moderate_similarity_count = sum(
+        1
+        for match in matches
+        if match.detection_method
+        == "MODERATE_SIMILARITY"
+    )
+
+    low_similarity_count = sum(
+        1
+        for match in matches
+        if match.detection_method
+        == "LOW_SIMILARITY"
+    )
+
+    # ========================================================
+    # BUILD MATCH RESPONSE
+    # ========================================================
+
+    match_responses = []
+
+    for match in matches:
+
+        reference_sentence = (
+            match.reference_sentence
+        )
+
+        reference_document = (
+            reference_sentence.reference_document
+            if reference_sentence
+            else None
+        )
+
+        scan_sentence = (
+            match.scan_sentence
+        )
+
+        match_responses.append(
+            PlagiarismMatchResponse(
+                id=str(match.id),
+
+                sentence_index=(
+                    scan_sentence.sentence_index
+                    if scan_sentence
+                    else 0
+                ),
+
+                scan_page_number=(
+                    scan_sentence.page.page_number
+                    if scan_sentence
+                    and scan_sentence.page
+                    else match.scan_page_number
+                ),
+
+                match_type=(
+                    match.detection_method
+                ),
+
+                similarity_score=float(
+                    match.similarity_score
+                ),
+
+                source=(
+                    reference_document.title
+                    if reference_document
+                    else "Unknown Source"
+                ),
+
+                reference_page_number=(
+                    reference_sentence.page_number
+                    if reference_sentence
+                    else match.reference_page_number
+                ),
+
+                scan_text=(
+                    scan_sentence.raw_text
+                    if scan_sentence
+                    else match.scan_text
+                ),
+
+                reference_text=(
+                    reference_sentence.raw_text
+                    if reference_sentence
+                    else match.reference_text
+                ),
+            )
+        )
+
+    # ========================================================
+    # UNMATCHED SENTENCES
+    # ========================================================
+
+    unmatched_sentence_responses = []
+
+    for sentence in scan_sentences:
+
+        if sentence.id in matched_sentence_ids:
+            continue
+
+        unmatched_sentence_responses.append(
+            UnmatchedSentenceResponse(
+                sentence_index=sentence.sentence_index,
+                scan_page_number=(
+                    sentence.page.page_number
+                    if sentence.page
+                    else None
+                ),
+                text=sentence.raw_text,
+                token_count=sentence.token_count,
+            )
+        )
+
+    # ========================================================
+    # SOURCE SUMMARY
+    # ========================================================
+
+    source_groups: dict[
+        str,
+        list[float]
+    ] = {}
+
+    for match in matches:
+
+        reference_sentence = (
+            match.reference_sentence
+        )
+
+        reference_document = (
+            reference_sentence.reference_document
+            if reference_sentence
+            else None
+        )
+
+        source_name = (
+            reference_document.title
+            if reference_document
+            else "Unknown Source"
+        )
+
+        source_groups.setdefault(
+            source_name,
+            [],
+        ).append(
+            float(match.similarity_score)
+        )
+
+    source_summary = []
+
+    for source_name, scores in source_groups.items():
+
+        source_summary.append(
+            PlagiarismSourceSummaryResponse(
+                source=source_name,
+
+                matched_sentences=len(scores),
+
+                average_similarity=round(
+                    sum(scores) / len(scores),
+                    4,
+                ),
+            )
+        )
+
+    source_summary.sort(
+        key=lambda item: item.matched_sentences,
+        reverse=True,
+    )
+
+    # ========================================================
+    # PAGE SUMMARY
+    # ========================================================
+
+    page_groups: dict[
+        int,
+        dict[str, int]
+    ] = {}
+
+    for sentence in scan_sentences:
+
+        if not sentence.page:
+            continue
+
+        page_number = (
+            sentence.page.page_number
+        )
+
+        if page_number not in page_groups:
+            page_groups[page_number] = {
+                "total": 0,
+                "matched": 0,
+            }
+
+        page_groups[page_number]["total"] += 1
+
+        if sentence.id in matched_sentence_ids:
+            page_groups[page_number]["matched"] += 1
+
+    page_summary = []
+
+    for page_number, values in sorted(
+        page_groups.items()
+    ):
+
+        page_sentence_count = values["total"]
+        page_matched_count = values["matched"]
+
+        page_coverage = (
+            (
+                page_matched_count
+                / page_sentence_count
+            )
+            * 100
+            if page_sentence_count
+            else 0.0
+        )
+
+        page_summary.append(
+            PlagiarismPageSummaryResponse(
+                page_number=page_number,
+                total_sentences=page_sentence_count,
+                matched_sentences=page_matched_count,
+                sentence_coverage_percentage=round(
+                    page_coverage,
+                    2,
+                ),
+            )
+        )
+
+    # ========================================================
+    # ALGORITHM SCORES
+    # ========================================================
+
+    algorithm_scores = (
+        PlagiarismAlgorithmScoresResponse(
+            exact=analysis.exact_match_score,
+            ngram=analysis.ngram_score,
+            tfidf=analysis.tfidf_score,
+            semantic=analysis.semantic_score,
+            cross_encoder=analysis.cross_encoder_score,
+        )
+    )
+
+    # ========================================================
+    # STATISTICS
+    # ========================================================
+
+    statistics = (
+        PlagiarismStatisticsResponse(
+            total_sentences=total_sentences,
+
+            matched_sentences=matched_sentences,
+
+            unmatched_sentences=unmatched_sentences,
+
+            sentence_coverage_percentage=round(
+                sentence_coverage_percentage,
+                2,
+            ),
+
+            text_coverage_percentage=round(
+                text_coverage_percentage,
+                2,
+            ),
+
+            average_match_strength=round(
+                average_match_strength,
+                4,
+            ),
+        )
+    )
+
+    # ========================================================
+    # MATCH COUNTS
+    # ========================================================
+
+    match_counts = (
+        PlagiarismMatchCountsResponse(
+            exact=exact_count,
+
+            high_similarity=(
+                high_similarity_count
+            ),
+
+            moderate_similarity=(
+                moderate_similarity_count
+            ),
+
+            low_similarity=low_similarity_count,
+        )
+    )
+
+    # ========================================================
+    # FINAL REPORT
+    # ========================================================
+
+    return PlagiarismReportResponse(
+        scan_id=str(scan.id),
+
+        analysis_id=str(analysis.id),
+
+        document_title=scan.title,
+
+        file_name=scan.file_name,
+
+        scanned_by=str(
+            scan.scanned_by
+        ),
+
+        scanned_on=(
+            scan.created_at.isoformat()
+        ),
+
+        completed_on=(
+            scan.completed_at.isoformat()
+            if scan.completed_at
+            else None
+        ),
+
+        status=analysis.status,
+
+        overall_similarity=(
+            float(analysis.overall_similarity)
+            if analysis.overall_similarity
+            is not None
+            else None
+        ),
+
+        statistics=statistics,
+
+        algorithm_scores=algorithm_scores,
+
+        match_counts=match_counts,
+
+        source_summary=source_summary,
+
+        page_summary=page_summary,
+
+        matches=match_responses,
+
+        unmatched_sentences=(
+            unmatched_sentence_responses
+        ),
+    )
+@router.get(
+    "/{scan_id}/plagiarism/sentences",
+)
+def get_plagiarism_sentences(
+    scan_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Return sentence-level plagiarism results.
+
+    This endpoint is designed for the frontend plagiarism
+    highlighting and detailed evidence view.
+
+    It returns:
+
+        Scan Sentence
+            |
+            +-- Match status
+            |
+            +-- Match type
+            |
+            +-- Similarity score
+            |
+            +-- Reference document
+            |
+            +-- Reference sentence
+            |
+            +-- Reference page
+            |
+            +-- Character-level highlighting
+    """
+
+    # =========================================================
+    # 1. Find scan
+    # =========================================================
+
+    scan = (
+        db.query(Scan)
+        .filter(
+            Scan.id == scan_id
+        )
+        .first()
+    )
+
+    if not scan:
+        raise HTTPException(
+            status_code=404,
+            detail="Scan not found.",
+        )
+
+    # =========================================================
+    # 2. Check access permission
+    # =========================================================
+
+    if not can_access_scan(
+        db,
+        scan,
+        current_user,
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "You do not have permission "
+                "to access this scan."
+            ),
+        )
+
+    # =========================================================
+    # 3. Get latest plagiarism analysis
+    # =========================================================
+
+    analysis = (
+        db.query(PlagiarismAnalysis)
+        .filter(
+            PlagiarismAnalysis.scan_id
+            == scan.id
+        )
+        .order_by(
+            PlagiarismAnalysis.created_at.desc()
+        )
+        .first()
+    )
+
+    if not analysis:
+        raise HTTPException(
+            status_code=404,
+            detail="Plagiarism analysis not found.",
+        )
+
+    # =========================================================
+    # 4. Load scan sentences
+    # =========================================================
+
+    scan_sentences = (
+        db.query(ScanSentence)
+        .join(
+            ScanPage,
+            ScanSentence.page_id == ScanPage.id,
+        )
+        .options(
+            joinedload(ScanSentence.page),
+            joinedload(ScanSentence.section).joinedload(
+                ScanSection.parent_section
+            ),
+        )
+        .filter(
+            ScanSentence.scan_id
+            == scan.id
+        )
+        .order_by(
+            ScanPage.page_number.asc(),
+            ScanSentence.sentence_index.asc(),
+            ScanSentence.id.asc(),
+        )
+        .all()
+    )
+
+    # =========================================================
+    # 5. Load plagiarism matches
+    # =========================================================
+
+    matches = (
+        db.query(PlagiarismMatch)
+        .options(
+            joinedload(
+                PlagiarismMatch.reference_sentence
+            ).joinedload(
+                ReferenceSentence.reference_document
+            ),
+            joinedload(
+                PlagiarismMatch.scan_sentence
+            ),
+        )
+        .filter(
+            PlagiarismMatch.analysis_id
+            == analysis.id
+        )
+        .all()
+    )
+
+    # =========================================================
+    # 6. Group matches by scan sentence
+    # =========================================================
+
+    matches_by_sentence = {}
+
+    for match in matches:
+
+        sentence_id = str(
+            match.scan_sentence_id
+        )
+
+        if sentence_id not in matches_by_sentence:
+            matches_by_sentence[
+                sentence_id
+            ] = []
+
+        matches_by_sentence[
+            sentence_id
+        ].append(match)
+
+    # =========================================================
+    # 7. Build sentence results
+    # =========================================================
+
+    sentence_results = []
+
+    for scan_sentence in scan_sentences:
+
+        sentence_id = str(
+            scan_sentence.id
+        )
+        paragraph_section = scan_sentence.section
+        parent_section = (
+            paragraph_section.parent_section
+            if paragraph_section
+            else None
+        )
+        section_metadata = {
+            "section_id": (
+                str(parent_section.id)
+                if parent_section
+                else None
+            ),
+            "section_title": (
+                parent_section.section_title
+                if parent_section
+                else None
+            ),
+            "paragraph_id": (
+                str(paragraph_section.id)
+                if paragraph_section
+                else None
+            ),
+            "paragraph_title": (
+                paragraph_section.section_title
+                if paragraph_section
+                else None
+            ),
+        }
+
+        sentence_matches = (
+            matches_by_sentence.get(
+                sentence_id,
+                [],
+            )
+        )
+
+        # =====================================================
+        # UNMATCHED SENTENCE
+        # =====================================================
+
+        if not sentence_matches:
+
+            sentence_results.append(
+                {
+                    "sentence_id": sentence_id,
+                    "sentence_index": (
+                        scan_sentence.sentence_index
+                    ),
+                    "page_number": (
+                        scan_sentence.page.page_number
+                        if scan_sentence.page
+                        else None
+                    ),
+                    "text": (
+                        scan_sentence.raw_text
+                    ),
+                    "normalized_text": (
+                        scan_sentence.normalized_text
+                    ),
+                    "token_count": (
+                        scan_sentence.token_count
+                    ),
+                    **section_metadata,
+                    "matched": False,
+                    "match_count": 0,
+                    "best_match": None,
+                    "matches": [],
+                    "highlighting": {
+                        "segments": [
+                            {
+                                "text": (
+                                    scan_sentence.raw_text
+                                ),
+                                "matched": False,
+                            }
+                        ],
+                        "matched": False,
+                        "matched_character_count": 0,
+                        "total_character_count": len(
+                            scan_sentence.raw_text
+                        ),
+                        "character_coverage_percentage": 0.0,
+                    },
+                }
+            )
+
+            continue
+
+        # =====================================================
+        # SORT MATCHES
+        # =====================================================
+
+        sorted_matches = sorted(
+            sentence_matches,
+            key=lambda item: (
+                float(
+                    item.similarity_score
+                )
+                if item.similarity_score
+                is not None
+                else 0.0
+            ),
+            reverse=True,
+        )
+
+        best_match = sorted_matches[0]
+
+        # =====================================================
+        # BUILD MATCH RESULTS
+        # =====================================================
+
+        match_results = []
+
+        for match in sorted_matches:
+
+            reference_sentence = (
+                match.reference_sentence
+            )
+
+            reference_document = None
+
+            if reference_sentence:
+                reference_document = (
+                    reference_sentence
+                    .reference_document
+                )
+
+            source_name = None
+
+            if reference_document:
+                source_name = (
+                    reference_document.title
+                )
+
+            reference_text = (
+                reference_sentence.raw_text
+                if reference_sentence
+                else match.reference_text
+            )
+
+            # -------------------------------------------------
+            # Character-level highlighting
+            # -------------------------------------------------
+
+            highlighting = generate_highlighting(
+                scan_text=(
+                    scan_sentence.raw_text
+                ),
+                reference_text=(
+                    reference_text or ""
+                ),
+            )
+
+            match_results.append(
+                {
+                    "match_id": str(
+                        match.id
+                    ),
+                    "match_type": (
+                        match.detection_method
+                    ),
+                    "similarity_score": (
+                        float(
+                            match.similarity_score
+                        )
+                        if match.similarity_score
+                        is not None
+                        else 0.0
+                    ),
+                    "source": source_name,
+                    "reference_sentence_id": (
+                        str(
+                            reference_sentence.id
+                        )
+                        if reference_sentence
+                        else None
+                    ),
+                    "reference_page_number": (
+                        reference_sentence.page_number
+                        if reference_sentence
+                        else match.reference_page_number
+                    ),
+                    "reference_sentence_index": (
+                        reference_sentence.sentence_index
+                        if reference_sentence
+                        else None
+                    ),
+                    "reference_text": (
+                        reference_text
+                    ),
+                    "highlighting": highlighting,
+                }
+            )
+
+        # =====================================================
+        # BEST MATCH HIGHLIGHTING
+        # =====================================================
+
+        best_reference_sentence = (
+            best_match.reference_sentence
+        )
+
+        best_reference_text = (
+            best_reference_sentence.raw_text
+            if best_reference_sentence
+            else best_match.reference_text
+        )
+
+        best_highlighting = (
+            generate_highlighting(
+                scan_text=(
+                    scan_sentence.raw_text
+                ),
+                reference_text=(
+                    best_reference_text or ""
+                ),
+            )
+        )
+
+        best_source = None
+
+        if (
+            best_reference_sentence
+            and best_reference_sentence
+            .reference_document
+        ):
+            best_source = (
+                best_reference_sentence
+                .reference_document
+                .title
+            )
+
+        # =====================================================
+        # ADD MATCHED SENTENCE
+        # =====================================================
+
+        sentence_results.append(
+            {
+                "sentence_id": sentence_id,
+                "sentence_index": (
+                    scan_sentence.sentence_index
+                ),
+                "page_number": (
+                    scan_sentence.page.page_number
+                    if scan_sentence.page
+                    else None
+                ),
+                "text": (
+                    scan_sentence.raw_text
+                ),
+                "normalized_text": (
+                    scan_sentence.normalized_text
+                ),
+                "token_count": (
+                    scan_sentence.token_count
+                ),
+                **section_metadata,
+                "matched": True,
+                "match_count": len(
+                    match_results
+                ),
+                "best_match": {
+                    "match_id": str(
+                        best_match.id
+                    ),
+                    "match_type": (
+                        best_match.detection_method
+                    ),
+                    "similarity_score": (
+                        float(
+                            best_match.similarity_score
+                        )
+                        if best_match.similarity_score
+                        is not None
+                        else 0.0
+                    ),
+                    "source": best_source,
+                    "reference_page_number": (
+                        best_reference_sentence.page_number
+                        if best_reference_sentence
+                        else best_match.reference_page_number
+                    ),
+                    "reference_text": (
+                        best_reference_text
+                    ),
+                    "highlighting": (
+                        best_highlighting
+                    ),
+                },
+                "matches": match_results,
+                "highlighting": (
+                    best_highlighting
+                ),
+            }
+        )
+
+    # =========================================================
+    # 8. Calculate summary counts
+    # =========================================================
+
+    total_sentences = len(
+        sentence_results
+    )
+
+    matched_sentences = sum(
+        1
+        for sentence in sentence_results
+        if sentence["matched"]
+    )
+
+    unmatched_sentences = (
+        total_sentences
+        - matched_sentences
+    )
+
+    sentence_coverage = (
+        (
+            matched_sentences
+            / total_sentences
+        )
+        * 100
+        if total_sentences
+        else 0.0
+    )
+
+    # =========================================================
+    # 9. Return response
+    # =========================================================
+
+    return {
+        "scan_id": str(
+            scan.id
+        ),
+        "analysis_id": str(
+            analysis.id
+        ),
+        "status": analysis.status,
+        "total_sentences": (
+            total_sentences
+        ),
+        "matched_sentences": (
+            matched_sentences
+        ),
+        "unmatched_sentences": (
+            unmatched_sentences
+        ),
+        "sentence_coverage_percentage": round(
+            sentence_coverage,
+            2,
+        ),
+        "sentences": sentence_results,
+    }
+
+@router.get(
+    "/{scan_id}/plagiarism/compare",
+    response_model=PlagiarismCompareResponse,
+)
+def compare_plagiarism_content(
+    scan_id: str,
+    reference_document_id: str | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(
+        require_roles("ADMIN", "INSTRUCTOR")
+    ),
+):
+    # --------------------------------------------------------
+    # Validate scan UUID
+    # --------------------------------------------------------
+
+    try:
+        scan_uuid = UUID(scan_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid scan_id.",
+        )
+
+    # --------------------------------------------------------
+    # Find scan
+    # --------------------------------------------------------
+
+    scan = (
+        db.query(Scan)
+        .filter(
+            Scan.id == scan_uuid
+        )
+        .first()
+    )
+
+    if not scan:
+        raise HTTPException(
+            status_code=404,
+            detail="Scan not found.",
+        )
+
+    # --------------------------------------------------------
+    # Check access
+    # --------------------------------------------------------
+
+    if not can_access_scan(
+        db=db,
+        scan=scan,
+        current_user=current_user,
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="You are not allowed to access this scan.",
+        )
+
+    # --------------------------------------------------------
+    # Find completed analysis
+    # --------------------------------------------------------
+
+    analysis = (
+        db.query(PlagiarismAnalysis)
+        .filter(
+            PlagiarismAnalysis.scan_id == scan.id,
+            PlagiarismAnalysis.status == "COMPLETED",
+        )
+        .order_by(
+            PlagiarismAnalysis.created_at.desc()
+        )
+        .first()
+    )
+
+    if not analysis:
+        raise HTTPException(
+            status_code=404,
+            detail="Completed plagiarism analysis not found.",
+        )
+
+    # --------------------------------------------------------
+    # Validate optional reference document
+    # --------------------------------------------------------
+
+    reference_uuid = None
+
+    if reference_document_id:
+        try:
+            reference_uuid = UUID(
+                reference_document_id
+            )
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid reference_document_id.",
+            )
+
+        reference_exists = (
+            db.query(ReferenceDocument)
+            .filter(
+                ReferenceDocument.id
+                == reference_uuid
+            )
+            .first()
+        )
+
+        if not reference_exists:
+            raise HTTPException(
+                status_code=404,
+                detail="Reference document not found.",
+            )
+
+    # --------------------------------------------------------
+    # Load plagiarism matches
+    # --------------------------------------------------------
+
+    query = (
+        db.query(
+            PlagiarismMatch,
+            ReferenceDocument,
+        )
+        .join(
+            ScanSentence,
+            PlagiarismMatch.scan_sentence_id == ScanSentence.id,
+        )
+        .join(
+            ReferenceDocument,
+            PlagiarismMatch.reference_document_id
+            == ReferenceDocument.id,
+        )
+        .options(
+            joinedload(PlagiarismMatch.scan_sentence)
+            .joinedload(ScanSentence.section)
+            .joinedload(ScanSection.parent_section),
+        )
+        .filter(
+            PlagiarismMatch.analysis_id
+            == analysis.id,
+            ScanSentence.scan_id == scan.id,
+        )
+    )
+
+    if reference_uuid:
+        query = query.filter(
+            PlagiarismMatch.reference_document_id
+            == reference_uuid
+        )
+
+    rows = (
+        query
+        .order_by(
+            PlagiarismMatch.scan_sentence_id,
+            PlagiarismMatch.similarity_score.desc(),
+        )
+        .all()
+    )
+
+    # --------------------------------------------------------
+    # Build reference document summary
+    # --------------------------------------------------------
+
+    reference_map = {}
+
+    for match, reference in rows:
+        reference_id = str(
+            reference.id
+        )
+
+        if reference_id not in reference_map:
+            reference_map[reference_id] = {
+                "id": reference_id,
+                "title": reference.title,
+                "file_name": reference.file_name,
+                "match_count": 0,
+            }
+
+        reference_map[
+            reference_id
+        ]["match_count"] += 1
+
+    # --------------------------------------------------------
+    # Build comparison matches
+    # --------------------------------------------------------
+
+    comparison_matches = []
+
+    for match, reference in rows:
+        scan_section = (
+            match.scan_sentence.section
+            if match.scan_sentence
+            else None
+        )
+        parent_section = (
+            scan_section.parent_section
+            if scan_section
+            else None
+        )
+
+        comparison_matches.append(
+            CompareMatchResponse(
+                match_id=str(match.id),
+                reference_document_id=str(reference.id),
+                reference_title=reference.title,
+                reference_file_name=reference.file_name,
+
+                sentence_index=(
+                    match.scan_sentence.sentence_index
+                    if match.scan_sentence
+                    else 0
+                ),
+                section_title=(
+                    parent_section.section_title
+                    if parent_section
+                    else scan_section.section_title
+                    if scan_section
+                    else None
+                ),
+                paragraph_title=(
+                    scan_section.section_title
+                    if scan_section
+                    else None
+                ),
+
+                scan_page_number=(
+                    match.scan_page_number
+                ),
+
+                reference_page_number=(
+                    match.reference_page_number
+                ),
+
+                match_type=(
+                    match.detection_method
+                ),
+
+                similarity_score=(
+                    float(match.similarity_score)
+                ),
+
+                scan_text=match.scan_text,
+
+                reference_text=(
+                    match.reference_text
+                ),
+
+                scan_highlighting={},
+
+                reference_highlighting={},
+            )
+        )
+
+    # --------------------------------------------------------
+    # Return response
+    # --------------------------------------------------------
+
+    return PlagiarismCompareResponse(
+        scan_id=str(scan.id),
+        analysis_id=str(analysis.id),
+
+        scan_title=scan.title,
+        scan_file_name=scan.file_name,
+
+        reference_documents=[
+            CompareReferenceDocumentResponse(
+                **item
+            )
+            for item in reference_map.values()
+        ],
+
+        matches=comparison_matches,
+    )
+
+# ============================================================
+# GENERATE CERTIFICATE
+# ============================================================
+
+@router.post(
+    "/{scan_id}/certificate",
+    response_model=CertificateResponse,
+)
+def generate_scan_certificate(
+    scan_id: str,
+    request: CertificateGenerationRequest | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(
+        require_roles(
+            "ADMIN",
+            "INSTRUCTOR",
+        )
+    ),
+):
+    # --------------------------------------------------------
+    # Validate UUID
+    # --------------------------------------------------------
+
+    try:
+        scan_uuid = UUID(scan_id)
+
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid scan_id.",
+        )
+
+    # --------------------------------------------------------
+    # Find scan
+    # --------------------------------------------------------
+
+    scan = (
+        db.query(Scan)
+        .filter(
+            Scan.id == scan_uuid
+        )
+        .first()
+    )
+
+    if not scan:
+        raise HTTPException(
+            status_code=404,
+            detail="Scan not found.",
+        )
+
+    # --------------------------------------------------------
+    # Check access
+    # --------------------------------------------------------
+
+    if not can_access_scan(
+        db=db,
+        scan=scan,
+        current_user=current_user,
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="You do not have access to this scan.",
+        )
+
+    # --------------------------------------------------------
+    # Verify scan completed
+    # --------------------------------------------------------
+
+    if scan.status != "COMPLETED":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Certificate can only be generated "
+                "for a completed scan."
+            ),
+        )
+
+    # --------------------------------------------------------
+    # Check whether certificate already exists
+    # --------------------------------------------------------
+
+    existing = (
+        db.query(Certificate)
+        .filter(
+            Certificate.scan_id == scan.id
+        )
+        .first()
+    )
+
+    if existing:
+        return CertificateResponse(
+            id=str(existing.id),
+            scan_id=str(existing.scan_id),
+            certificate_number=(
+                existing.certificate_number
+            ),
+            certificate_path=(
+                existing.certificate_path
+            ),
+            generated_at=(
+                existing.generated_at.isoformat()
+            ),
+            generated_by=(
+                str(existing.generated_by)
+            ),
+            certificate_hash=(
+                existing.certificate_hash
+            ),
+            status=existing.status,
+        )
+
+    # --------------------------------------------------------
+    # Generate certificate
+    # --------------------------------------------------------
+
+    try:
+        certificate = create_certificate(
+            db=db,
+            scan=scan,
+            generated_by=current_user,
+            student_name_override=(
+                request.student_name if request else None
+            ),
+            service_number_override=(
+                request.service_number if request else None
+            ),
+            course_override=request.course if request else None,
+            batch_override=request.batch if request else None,
+        )
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        )
+
+    except Exception:
+        db.rollback()
+
+        raise HTTPException(
+            status_code=500,
+            detail="Certificate generation failed.",
+        )
+
+    # --------------------------------------------------------
+    # Audit
+    # --------------------------------------------------------
+
+    create_audit_log(
+        db=db,
+        user_id=current_user.id,
+        action="CERTIFICATE_GENERATED",
+        entity_type="CERTIFICATE",
+        entity_id=certificate.id,
+        new_values={
+            "scan_id": str(scan.id),
+            "certificate_number": (
+                certificate.certificate_number
+            ),
+            "certificate_hash": (
+                certificate.certificate_hash
+            ),
+        },
+    )
+
+    db.commit()
+    db.refresh(certificate)
+
+    return CertificateResponse(
+        id=str(certificate.id),
+        scan_id=str(certificate.scan_id),
+        certificate_number=(
+            certificate.certificate_number
+        ),
+        certificate_path=(
+            certificate.certificate_path
+        ),
+        generated_at=(
+            certificate.generated_at.isoformat()
+        ),
+        generated_by=(
+            str(certificate.generated_by)
+        ),
+        certificate_hash=(
+            certificate.certificate_hash
+        ),
+        status=certificate.status,
+    )
+
+# ============================================================
+# DOWNLOAD CERTIFICATE
+# ============================================================
+
+@router.get(
+    "/{scan_id}/certificate/download",
+)
+def download_scan_certificate(
+    scan_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(
+        require_roles(
+            "ADMIN",
+            "INSTRUCTOR",
+        )
+    ),
+):
+    # --------------------------------------------------------
+    # Validate UUID
+    # --------------------------------------------------------
+
+    try:
+        scan_uuid = UUID(scan_id)
+
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid scan_id.",
+        )
+
+    # --------------------------------------------------------
+    # Find scan
+    # --------------------------------------------------------
+
+    scan = (
+        db.query(Scan)
+        .filter(
+            Scan.id == scan_uuid
+        )
+        .first()
+    )
+
+    if not scan:
+        raise HTTPException(
+            status_code=404,
+            detail="Scan not found.",
+        )
+
+    # --------------------------------------------------------
+    # Access control
+    # --------------------------------------------------------
+
+    if not can_access_scan(
+        db=db,
+        scan=scan,
+        current_user=current_user,
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="You do not have access to this scan.",
+        )
+
+    # --------------------------------------------------------
+    # Find certificate
+    # --------------------------------------------------------
+
+    certificate = (
+        db.query(Certificate)
+        .filter(
+            Certificate.scan_id == scan.id
+        )
+        .first()
+    )
+
+    if not certificate:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "Certificate has not been generated "
+                "for this scan."
+            ),
+        )
+
+    # --------------------------------------------------------
+    # Verify physical file
+    # --------------------------------------------------------
+
+    certificate_path = Path(
+        certificate.certificate_path
+    )
+
+    if not certificate_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail="Certificate file not found.",
+        )
+
+    # --------------------------------------------------------
+    # Return PDF
+    # --------------------------------------------------------
+
+    return FileResponse(
+        path=str(certificate_path),
+        media_type="application/pdf",
+        filename=(
+            f"{certificate.certificate_number}.pdf"
+        ),
+    )

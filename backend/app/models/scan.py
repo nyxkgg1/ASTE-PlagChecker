@@ -1,0 +1,425 @@
+
+from __future__ import annotations
+
+import uuid
+from datetime import datetime
+
+from pgvector.sqlalchemy import Vector
+from sqlalchemy import (
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from app.db.base import Base
+from app.models.model_registry import ModelRegistry
+from app.models.user import User
+#from app.models.plagiarism import PlagiarismAnalysis
+
+class Scan(Base):
+    __tablename__ = "scans"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        server_default=func.gen_random_uuid(),
+    )
+
+    title: Mapped[str] = mapped_column(
+        String(500),
+        nullable=False,
+    )
+
+    file_name: Mapped[str] = mapped_column(
+        String(500),
+        nullable=False,
+    )
+
+    file_path: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+    )
+
+    file_size: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+    )
+
+    mime_type: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+    )
+
+    sha256_hash: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+    )
+
+    scanned_by: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id"),
+        nullable=False,
+    )
+
+    owner_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id"),
+        nullable=True,
+    )
+
+    status: Mapped[str] = mapped_column(
+        String(30),
+        nullable=False,
+        default="UPLOADED",
+    )
+
+        # Administrative review is separate from scan processing status.
+    approval_status: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="PENDING",
+        server_default="PENDING",
+    )
+
+    admin_approval_date: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    reviewed_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id"),
+        nullable=True,
+    )
+
+    admin_comments: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+    
+    processing_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    processing_completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    # ========================================================
+    # Relationships
+    # ========================================================
+
+    scanner: Mapped["User"] = relationship(
+        foreign_keys=[scanned_by],
+    )
+
+    owner: Mapped["User | None"] = relationship(
+        foreign_keys=[owner_id],
+    )
+
+    pages: Mapped[list["ScanPage"]] = relationship(
+        back_populates="scan",
+        cascade="all, delete-orphan",
+    )
+
+    sections: Mapped[list["ScanSection"]] = relationship(
+        back_populates="scan",
+        cascade="all, delete-orphan",
+    )
+
+    sentences: Mapped[list["ScanSentence"]] = relationship(
+        back_populates="scan",
+        cascade="all, delete-orphan",
+    )
+
+    plagiarism_analyses: Mapped[
+        list["PlagiarismAnalysis"]
+    ] = relationship(
+        "PlagiarismAnalysis",
+        back_populates="scan",
+        cascade="all, delete-orphan",
+    )
+
+    completed_at: Mapped[datetime | None] = mapped_column(
+    DateTime(timezone=True),
+    nullable=True,
+)
+
+class ScanPage(Base):
+    __tablename__ = "scan_pages"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        server_default=func.gen_random_uuid(),
+    )
+
+    scan_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "scans.id",
+            ondelete="CASCADE",
+        ),
+        nullable=False,
+    )
+
+    page_number: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+    )
+
+    raw_text: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+    # ========================================================
+    # Relationships
+    # ========================================================
+
+    scan: Mapped["Scan"] = relationship(
+        back_populates="pages",
+    )
+
+    sentences: Mapped[list["ScanSentence"]] = relationship(
+        back_populates="page",
+        cascade="all, delete-orphan",
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "scan_id",
+            "page_number",
+            name="uq_scan_page_number",
+        ),
+    )
+
+
+class ScanSection(Base):
+    __tablename__ = "scan_sections"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        server_default=func.gen_random_uuid(),
+    )
+
+    scan_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "scans.id",
+            ondelete="CASCADE",
+        ),
+        nullable=False,
+    )
+
+    parent_section_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "scan_sections.id",
+        ),
+        nullable=True,
+    )
+
+    section_title: Mapped[str] = mapped_column(
+        String(500),
+        nullable=False,
+    )
+
+    normalized_title: Mapped[str] = mapped_column(
+        String(500),
+        nullable=False,
+    )
+
+    section_level: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+    )
+
+    section_order: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+    )
+
+    page_start: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+    )
+
+    page_end: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+    )
+
+    detection_confidence: Mapped[float | None] = mapped_column(
+        Float,
+        nullable=True,
+    )
+
+    # ========================================================
+    # Relationships
+    # ========================================================
+
+    scan: Mapped["Scan"] = relationship(
+        back_populates="sections",
+    )
+
+    parent_section: Mapped["ScanSection | None"] = relationship(
+        remote_side=[id],
+        back_populates="child_sections",
+    )
+
+    child_sections: Mapped[list["ScanSection"]] = relationship(
+        back_populates="parent_section",
+    )
+
+
+class ScanSentence(Base):
+    __tablename__ = "scan_sentences"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        server_default=func.gen_random_uuid(),
+    )
+
+    scan_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "scans.id",
+            ondelete="CASCADE",
+        ),
+        nullable=False,
+    )
+
+    page_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "scan_pages.id",
+            ondelete="CASCADE",
+        ),
+        nullable=False,
+    )
+
+    section_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "scan_sections.id",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+    )
+
+    sentence_index: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+    )
+
+    raw_text: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+    )
+
+    normalized_text: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+    )
+
+    token_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+    # ========================================================
+    # Relationships
+    # ========================================================
+
+    scan: Mapped["Scan"] = relationship(
+        back_populates="sentences",
+    )
+
+    page: Mapped["ScanPage"] = relationship(
+        back_populates="sentences",
+    )
+
+    section: Mapped["ScanSection | None"] = relationship()
+
+
+class ScanEmbedding(Base):
+    __tablename__ = "scan_embeddings"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        server_default=func.gen_random_uuid(),
+    )
+
+    sentence_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "scan_sentences.id",
+            ondelete="CASCADE",
+        ),
+        nullable=False,
+    )
+
+    model_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "model_registry.id",
+        ),
+        nullable=True,
+    )
+
+    embedding = mapped_column(
+        Vector(1024),
+        nullable=False,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+    # ========================================================
+    # Relationships
+    # ========================================================
+
+    sentence: Mapped["ScanSentence"] = relationship()
+
+    model: Mapped["ModelRegistry | None"] = relationship()

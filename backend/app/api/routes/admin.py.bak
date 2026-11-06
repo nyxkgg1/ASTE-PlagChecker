@@ -1,0 +1,1746 @@
+#from backend.app import db
+from fastapi import APIRouter, Depends, HTTPException, status, File, Form, UploadFile
+from sqlalchemy.orm import Session
+from datetime import datetime, timezone
+from app.schemas.reference import ReferenceDocumentResponse
+from app.schemas.reference import ReviewReferenceRequestPayload
+from app.models.reference import ReferenceDocument
+from app.api.dependencies import require_roles
+from app.core.security import hash_password
+from app.db.database import get_db
+from app.models.user import User, Role, UserRole
+from app.schemas.admin import (
+    CreateUserRequest,
+    RoleAssignmentRequest,
+    UserResponse,
+)
+from uuid import uuid4
+from uuid import UUID
+from app.services.audit_service import create_audit_log
+from app.models.audit import AuditLog
+from app.models.reference import (
+    ReferenceDocument,
+    ReferenceDocumentVersion,
+)
+from app.schemas.reference import DocumentRequest
+from app.schemas.reference import ReferenceRequestResponse
+from pathlib import Path
+from uuid import uuid4
+from app.schemas.reference import (
+    CreateReferenceAddRequestResponse,
+)
+from app.services.reference_service import save_reference_file
+from fastapi.responses import FileResponse
+from app.models.certificate import Certificate
+from app.models.plagiarism import PlagiarismAnalysis
+from app.models.scan import Scan
+import hashlib
+import hmac
+from app.core.config import settings
+from app.services.reference_index_service import index_reference_document
+
+router = APIRouter(
+    prefix="/admin",
+    tags=["Admin"],
+)
+
+
+def serialize_user(user: User) -> UserResponse:
+    roles = [
+        user_role.role.role_name
+        for user_role in user.user_roles
+    ]
+
+    return UserResponse(
+        id=str(user.id),
+        username=user.username,
+        email=user.email,
+        full_name=user.full_name,
+        status=user.status,
+        roles=roles,
+    )
+
+
+# ---------------------------------------------------------
+# LIST USERS
+# ---------------------------------------------------------
+
+@router.get("/users", response_model=list[UserResponse])
+def list_users(
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(require_roles("ADMIN")),
+):
+    users = (
+        db.query(User)
+        .filter(User.status != "DELETED")
+        .order_by(User.created_at.desc())
+        .all()
+    )
+
+    return [serialize_user(user) for user in users]
+
+
+# ---------------------------------------------------------
+# CREATE USER
+# ---------------------------------------------------------
+
+@router.post(
+    "/users",
+    response_model=UserResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_user(
+    request: CreateUserRequest,
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(require_roles("ADMIN")),
+):
+    existing_username = (
+        db.query(User)
+        .filter(User.username == request.username)
+        .first()
+    )
+
+    if existing_username:
+        raise HTTPException(
+            status_code=409,
+            detail="Username already exists",
+        )
+
+    existing_email = (
+        db.query(User)
+        .filter(User.email == request.email)
+        .first()
+    )
+
+    if existing_email:
+        raise HTTPException(
+            status_code=409,
+            detail="Email already exists",
+        )
+
+    role = (
+        db.query(Role)
+        .filter(Role.role_name == request.role_name.upper())
+        .first()
+    )
+
+    if not role:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Role '{request.role_name}' does not exist",
+        )
+
+    user = User(
+        username=request.username,
+        email=request.email,
+        full_name=request.full_name,
+        password_hash=hash_password(request.password),
+        status="ACTIVE",
+    )
+
+    db.add(user)
+    db.flush()
+
+    user_role = UserRole(
+        user_id=user.id,
+        role_id=role.id,
+        assigned_by=current_admin.id,
+    )
+
+    db.add(user_role)
+    create_audit_log(
+    db,
+    user_id=current_admin.id,
+    action="USER_CREATED",
+    entity_type="USER",
+    entity_id=user.id,
+    old_values=None,
+    new_values={
+        "username": user.username,
+        "email": user.email,
+        "full_name": user.full_name,
+        "status": user.status,
+        "role": role.role_name,
+        },
+    )
+    db.commit()
+    db.refresh(user)
+
+    return serialize_user(user)
+
+
+# ---------------------------------------------------------
+# ACTIVATE USER
+# ---------------------------------------------------------
+
+@router.patch(
+    "/users/{user_id}/activate",
+    response_model=UserResponse,
+)
+def activate_user(
+    user_id: str,
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(require_roles("ADMIN")),
+):
+    user = db.query(User).filter(User.id == user_id).first()
+
+    if not user:
+        raise HTTPException(
+            status_code=404,
+            detail="User not found",
+        )
+
+    if user.status == "DELETED":
+        raise HTTPException(
+            status_code=400,
+            detail="Deleted users cannot be activated",
+        )
+    old_values = {
+        "status": user.status,
+    }
+    user.status = "ACTIVE"
+    user.deactivated_at = None
+    create_audit_log(
+    db,
+    user_id=current_admin.id,
+    action="USER_ACTIVATED",
+    entity_type="USER",
+    entity_id=user.id,
+    old_values=old_values,
+    new_values={
+        "status": "ACTIVE",
+    },
+)
+    db.commit()
+    db.refresh(user)
+
+    return serialize_user(user)
+
+
+# ---------------------------------------------------------
+# DEACTIVATE USER
+# ---------------------------------------------------------
+
+@router.patch(
+    "/users/{user_id}/deactivate",
+    response_model=UserResponse,
+)
+def deactivate_user(
+    user_id: str,
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(require_roles("ADMIN")),
+):
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(
+            status_code=404,
+            detail="User not found",
+        )
+
+    if user.status == "DELETED":
+        raise HTTPException(
+            status_code=400,
+            detail="User is already deleted",
+        )
+
+    if user.id == current_admin.id:
+        raise HTTPException(
+            status_code=400,
+            detail="You cannot deactivate your own account",
+        )
+    old_values = {
+        "status": user.status,
+    }
+    user.status = "INACTIVE"
+    create_audit_log(
+    db,
+    user_id=current_admin.id,
+    action="USER_DEACTIVATED",
+    entity_type="USER",
+    entity_id=user.id,
+    old_values=old_values,
+    new_values={
+        "status": "INACTIVE",
+        },
+    )
+    from datetime import datetime, timezone
+
+    user.deactivated_at = datetime.now(timezone.utc)
+
+    db.commit()
+    db.refresh(user)
+
+    return serialize_user(user)
+
+
+# ---------------------------------------------------------
+# SOFT DELETE USER
+# ---------------------------------------------------------
+
+@router.delete(
+    "/users/{user_id}",
+    response_model=UserResponse,
+)
+def delete_user(
+    user_id: str,
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(require_roles("ADMIN")),
+):
+    user = db.query(User).filter(User.id == user_id).first()
+
+    if not user:
+        raise HTTPException(
+            status_code=404,
+            detail="User not found",
+        )
+
+    if user.id == current_admin.id:
+        raise HTTPException(
+            status_code=400,
+            detail="You cannot delete your own account",
+        )
+
+    if user.status == "DELETED":
+        raise HTTPException(
+            status_code=400,
+            detail="User is already deleted",
+        )
+
+    from datetime import datetime, timezone
+    old_values = {
+        "status": user.status,
+    }
+    user.status = "DELETED"
+    user.deleted_at = datetime.now(timezone.utc)
+    create_audit_log(
+    db,
+    user_id=current_admin.id,
+    action="USER_DELETED",
+    entity_type="USER",
+    entity_id=user.id,
+    old_values=old_values,
+    new_values={
+        "status": "DELETED",
+        },
+    )
+    db.commit()
+    db.refresh(user)
+
+    return serialize_user(user)
+
+
+# ---------------------------------------------------------
+# ASSIGN ROLE
+# ---------------------------------------------------------
+
+@router.post(
+    "/users/{user_id}/roles",
+    response_model=UserResponse,
+)
+def assign_role(
+    user_id: str,
+    request: RoleAssignmentRequest,
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(require_roles("ADMIN")),
+):
+    user = db.query(User).filter(User.id == user_id).first()
+
+    if not user:
+        raise HTTPException(
+            status_code=404,
+            detail="User not found",
+        )
+
+    if user.status == "DELETED":
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot assign role to deleted user",
+        )
+
+    role = (
+        db.query(Role)
+        .filter(Role.role_name == request.role_name.upper())
+        .first()
+    )
+
+    if not role:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Role '{request.role_name}' does not exist",
+        )
+
+    existing_role = (
+        db.query(UserRole)
+        .filter(
+            UserRole.user_id == user.id,
+            UserRole.role_id == role.id,
+        )
+        .first()
+    )
+
+    if existing_role:
+        raise HTTPException(
+            status_code=409,
+            detail="User already has this role",
+        )
+
+    user_role = UserRole(
+        user_id=user.id,
+        role_id=role.id,
+        assigned_by=current_admin.id,
+    )
+
+    db.add(user_role)
+    create_audit_log(
+    db,
+    user_id=current_admin.id,
+    action="ROLE_ASSIGNED",
+    entity_type="USER",
+    entity_id=user.id,
+    old_values=None,
+    new_values={
+        "role": role.role_name,
+        "role_id": role.id,
+    },
+)
+    db.commit()
+    db.refresh(user)
+
+    return serialize_user(user)
+
+
+# ---------------------------------------------------------
+# REMOVE ROLE
+# ---------------------------------------------------------
+
+@router.delete(
+    "/users/{user_id}/roles/{role_id}",
+    response_model=UserResponse,
+)
+def remove_role(
+    user_id: str,
+    role_id: int,
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(require_roles("ADMIN")),
+):
+    user = db.query(User).filter(User.id == user_id).first()
+
+    if not user:
+        raise HTTPException(
+            status_code=404,
+            detail="User not found",
+        )
+
+    user_role = (
+        db.query(UserRole)
+        .filter(
+            UserRole.user_id == user.id,
+            UserRole.role_id == role_id,
+        )
+        .first()
+    )
+
+    if not user_role:
+        raise HTTPException(
+            status_code=404,
+            detail="Role assignment not found",
+        )
+
+    # Prevent an administrator from removing the last ADMIN role
+    role = db.query(Role).filter(Role.id == role_id).first()
+    create_audit_log(
+    db,
+    user_id=current_admin.id,
+    action="ROLE_REMOVED",
+    entity_type="USER",
+    entity_id=user.id,
+    old_values={
+        "role": role.role_name if role else None,
+        "role_id": role_id,
+    },
+    new_values=None,
+)
+    if role and role.role_name == "ADMIN":
+        admin_count = (
+            db.query(UserRole)
+            .join(Role)
+            .filter(Role.role_name == "ADMIN")
+            .count()
+        )
+
+        if admin_count <= 1:
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot remove the last ADMIN role",
+            )
+
+    db.delete(user_role)
+    db.commit()
+    db.refresh(user)
+
+    return serialize_user(user)
+
+@router.get("/audit-logs")
+def list_audit_logs(
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(require_roles("ADMIN")),
+):
+    logs = (
+        db.query(AuditLog)
+        .order_by(AuditLog.created_at.desc())
+        .limit(500)
+        .all()
+    )
+
+    return [
+        {
+            "id": str(log.id),
+            "user_id": str(log.user_id) if log.user_id else None,
+            "action": log.action,
+            "entity_type": log.entity_type,
+            "entity_id": str(log.entity_id) if log.entity_id else None,
+            "old_values": log.old_values,
+            "new_values": log.new_values,
+            "ip_address": str(log.ip_address) if log.ip_address else None,
+            "created_at": log.created_at,
+        }
+        for log in logs
+    ]
+
+@router.get(
+    "/requests",
+    response_model=list[ReferenceRequestResponse],
+)
+def get_reference_requests(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(
+        require_roles("ADMIN")
+    ),
+):
+    requests = (
+        db.query(DocumentRequest)
+        .order_by(DocumentRequest.created_at.desc())
+        .all()
+    )
+
+    return [
+        ReferenceRequestResponse(
+            id=str(item.id),
+            request_type=item.request_type,
+            requested_by=str(item.requested_by),
+            reference_document_id=(
+                str(item.reference_document_id)
+                if item.reference_document_id
+                else None
+            ),
+            title=item.title,
+            reason=item.reason,
+            status=item.status,
+            reviewed_by=(
+                str(item.reviewed_by)
+                if item.reviewed_by
+                else None
+            ),
+            reviewed_at=(
+                item.reviewed_at.isoformat()
+                if item.reviewed_at
+                else None
+            ),
+            rejection_reason=item.rejection_reason,
+            admin_comments=item.admin_comments,
+            created_at=item.created_at.isoformat(),
+        )
+        for item in requests
+    ]
+
+@router.patch(
+    "/requests/{request_id}/review",
+    response_model=ReferenceRequestResponse,
+)
+def review_reference_request(
+    request_id: UUID,
+    review: ReviewReferenceRequestPayload,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(
+        require_roles("ADMIN")
+    ),
+):
+    document_request = (
+        db.query(DocumentRequest)
+        .filter(DocumentRequest.id == request_id)
+        .first()
+    )
+
+    if not document_request:
+        raise HTTPException(
+            status_code=404,
+            detail="Request not found",
+        )
+
+    if document_request.status != "PENDING":
+        raise HTTPException(
+            status_code=400,
+            detail="Only pending requests can be reviewed",
+        )
+
+    if (
+        review.decision == "REJECTED"
+        and not review.rejection_reason
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Rejection reason is required",
+        )
+    reference_to_index = None
+    # --------------------------------------------------
+    # APPROVAL
+    # --------------------------------------------------
+
+    if review.decision == "APPROVED":
+
+        if document_request.request_type == "DELETE":
+
+            reference = (
+                db.query(ReferenceDocument)
+                .filter(
+                    ReferenceDocument.id
+                    == document_request.reference_document_id
+                )
+                .first()
+            )
+
+            if not reference:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Reference document not found",
+                )
+
+            reference.status = "DELETED"
+
+            create_audit_log(
+                db,
+                user_id=current_user.id,
+                action="REFERENCE_DELETED",
+                entity_type="REFERENCE_DOCUMENT",
+                entity_id=reference.id,
+                old_values={
+                    "status": reference.status
+                },
+                new_values={
+                    "status": "DELETED"
+                },
+            )
+
+        elif document_request.request_type == "UPDATE":
+
+            reference = (
+                db.query(ReferenceDocument)
+                .filter(
+                    ReferenceDocument.id
+                    == document_request.reference_document_id
+                )
+                .first()
+            )
+
+            if not reference:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Reference document not found",
+                )
+
+            old_title = reference.title
+
+            reference.title = document_request.title
+
+            create_audit_log(
+                db,
+                user_id=current_user.id,
+                action="REFERENCE_UPDATED",
+                entity_type="REFERENCE_DOCUMENT",
+                entity_id=reference.id,
+                old_values={
+                    "title": old_title
+                },
+                new_values={
+                    "title": reference.title
+                },
+            )
+
+        elif document_request.request_type == "ADD":
+            if not document_request.admin_comments:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Uploaded document information is missing",
+                )
+
+            metadata = {}
+
+            for line in document_request.admin_comments.splitlines():
+                if "=" in line:
+                    key, value = line.split("=", 1)
+                    metadata[key] = value
+
+            file_path = metadata.get("FILE_PATH")
+            file_name = metadata.get("FILE_NAME")
+            file_size = metadata.get("FILE_SIZE")
+            mime_type = metadata.get("MIME_TYPE")
+            sha256_hash = metadata.get("SHA256")
+
+            if not all([
+                file_path,
+                file_name,
+                file_size,
+                mime_type,
+                sha256_hash,
+            ]):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Incomplete uploaded document information",
+                )
+            
+            source_path = Path(file_path)
+            #source_path.replace(permanent_path)
+            if not source_path.exists():
+                raise HTTPException(
+                    status_code=404,
+                    detail="Uploaded document file not found",
+                )
+
+    # -----------------------------------------------
+    # Final duplicate check
+    # -----------------------------------------------
+
+            existing_reference = (
+                db.query(ReferenceDocument)
+                .filter(
+                    ReferenceDocument.sha256_hash
+                    == sha256_hash,
+                    ReferenceDocument.status != "DELETED",
+                )
+                .first()
+            )
+
+            if existing_reference:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "This document already exists in "
+                        "the reference database."
+                    ),
+                )
+
+    # -----------------------------------------------
+    # Move document into permanent reference storage
+    # -----------------------------------------------
+
+            extension = source_path.suffix.lower()
+
+            permanent_filename = (
+                f"{uuid4()}{extension}"
+            )
+
+            permanent_path = (
+                Path(settings.upload_dir)
+                / "reference_documents"
+                / permanent_filename
+            )
+
+            permanent_path.parent.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            source_path.replace(permanent_path)
+
+    # -----------------------------------------------
+    # Create reference document
+    # -----------------------------------------------
+
+            reference = ReferenceDocument(
+                title=document_request.title,
+                document_type="FTER",
+                file_name=file_name,
+                file_path=str(permanent_path),
+                file_size=int(file_size),
+                mime_type=mime_type,
+                sha256_hash=sha256_hash,
+                status="ACTIVE",
+                current_version=1,
+                added_by=document_request.requested_by,
+                approved_by=current_user.id,
+                approved_at=datetime.now(timezone.utc),
+            )
+
+            db.add(reference)
+
+            db.flush()
+
+            document_request.reference_document_id = reference.id
+
+            create_audit_log(
+                db,
+                user_id=current_user.id,
+                action="REFERENCE_CREATED_FROM_REQUEST",
+                entity_type="REFERENCE_DOCUMENT",
+                entity_id=reference.id,
+                new_values={
+                    "title": reference.title,
+                    "sha256_hash": reference.sha256_hash,
+                    "source_request_id": str(
+                        document_request.id
+                    ),
+                },
+            )
+
+
+
+    # --------------------------------------------------
+    # UPDATE REQUEST STATUS
+    # --------------------------------------------------
+
+    document_request.status = review.decision
+    document_request.reviewed_by = current_user.id
+    document_request.reviewed_at = datetime.now(timezone.utc)
+    document_request.admin_comments = review.admin_comments
+
+    if review.decision == "REJECTED":
+        document_request.rejection_reason = (
+            review.rejection_reason
+        )
+
+    create_audit_log(
+        db,
+        user_id=current_user.id,
+        action=f"REFERENCE_REQUEST_{review.decision}",
+        entity_type="DOCUMENT_REQUEST",
+        entity_id=document_request.id,
+        new_values={
+            "status": review.decision,
+            "admin_comments": review.admin_comments,
+            "rejection_reason": review.rejection_reason,
+        },
+    )
+
+    
+    db.commit()
+    db.refresh(document_request)
+
+    # Index only newly approved Instructor ADD references.
+    if reference_to_index is not None:
+        reference_id = str(reference_to_index.id)
+
+        try:
+            sentence_count = index_reference_document(
+                db=db,
+                reference_document=reference_to_index,
+            )
+
+            create_audit_log(
+                db,
+                user_id=current_user.id,
+                action="REFERENCE_INDEXED",
+                entity_type="REFERENCE_DOCUMENT",
+                entity_id=reference_to_index.id,
+                new_values={
+                    "version": reference_to_index.current_version,
+                    "sentence_count": sentence_count,
+                    "trigger": "INSTRUCTOR_REQUEST_APPROVAL",
+                },
+            )
+            db.commit()
+
+            print(
+                f"Reference indexed successfully: "
+                f"{reference_id}, sentences={sentence_count}"
+            )
+
+        except Exception as exc:
+            db.rollback()
+            print(
+                f"Reference indexing failed for "
+                f"{reference_id}: {exc}"
+            )
+
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "The reference approval was saved, but "
+                    f"indexing failed for reference {reference_id}. "
+                    "Check backend logs and retry indexing."
+                ),
+            )
+
+
+    return ReferenceRequestResponse(
+        id=str(document_request.id),
+        request_type=document_request.request_type,
+        requested_by=str(document_request.requested_by),
+        reference_document_id=(
+            str(document_request.reference_document_id)
+            if document_request.reference_document_id
+            else None
+        ),
+        title=document_request.title,
+        reason=document_request.reason,
+        status=document_request.status,
+        reviewed_by=(
+            str(document_request.reviewed_by)
+            if document_request.reviewed_by
+            else None
+        ),
+        reviewed_at=(
+            document_request.reviewed_at.isoformat()
+            if document_request.reviewed_at
+            else None
+        ),
+        rejection_reason=document_request.rejection_reason,
+        admin_comments=document_request.admin_comments,
+        created_at=document_request.created_at.isoformat(),
+    )
+
+@router.get(
+    "/requests/{request_id}/file"
+)
+def get_reference_request_file(
+    request_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(
+        require_roles("ADMIN")
+    ),
+):
+    request = (
+        db.query(DocumentRequest)
+        .filter(
+            DocumentRequest.id == request_id
+        )
+        .first()
+    )
+
+    if not request:
+        raise HTTPException(
+            status_code=404,
+            detail="Request not found",
+        )
+
+    if request.request_type != "ADD":
+        raise HTTPException(
+            status_code=400,
+            detail="This request does not contain an uploaded ADD document",
+        )
+
+    if not request.admin_comments:
+        raise HTTPException(
+            status_code=404,
+            detail="Pending file information not found",
+        )
+
+    file_path = None
+
+    for line in request.admin_comments.splitlines():
+        if line.startswith("FILE_PATH="):
+            file_path = line.replace(
+                "FILE_PATH=",
+                "",
+                1,
+            )
+
+    if not file_path:
+        raise HTTPException(
+            status_code=404,
+            detail="Pending file path not found",
+        )
+
+    path = Path(file_path)
+
+    if not path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail="Pending document file not found",
+        )
+
+    return FileResponse(
+        path=str(path),
+        filename=path.name,
+        media_type="application/octet-stream",
+    )
+
+
+# ============================================================
+# ADMIN CERTIFICATE MANAGEMENT
+# ============================================================
+
+
+def build_admin_certificate_response(
+    db: Session,
+    certificate: Certificate,
+):
+    """
+    Build certificate details for the Admin dashboard.
+    """
+
+    # --------------------------------------------------------
+    # Find associated scan
+    # --------------------------------------------------------
+
+    scan = (
+        db.query(Scan)
+        .filter(
+            Scan.id == certificate.scan_id
+        )
+        .first()
+    )
+
+    if not scan:
+        return {
+            "id": str(certificate.id),
+            "scan_id": str(certificate.scan_id),
+            "certificate_number": certificate.certificate_number,
+            "document_title": None,
+            "generated_at": (
+                certificate.generated_at.isoformat()
+                if certificate.generated_at
+                else None
+            ),
+            "generated_by": str(certificate.generated_by),
+            "certificate_hash": certificate.certificate_hash,
+            "status": certificate.status,
+            "plagiarism_score_percent": None,
+            "ai_score": "N/A",
+            "user": None,
+        }
+
+    # --------------------------------------------------------
+    # Find latest plagiarism analysis
+    # --------------------------------------------------------
+
+    analysis = (
+        db.query(PlagiarismAnalysis)
+        .filter(
+            PlagiarismAnalysis.scan_id == scan.id
+        )
+        .order_by(
+            PlagiarismAnalysis.created_at.desc()
+        )
+        .first()
+    )
+
+    plagiarism_score = None
+
+    if (
+        analysis
+        and analysis.overall_similarity is not None
+    ):
+        plagiarism_score = round(
+            float(analysis.overall_similarity) * 100,
+            2,
+        )
+
+    # --------------------------------------------------------
+    # Identify the document owner
+    # --------------------------------------------------------
+
+    user_id = scan.owner_id or scan.scanned_by
+
+    document_user = (
+        db.query(User)
+        .filter(
+            User.id == user_id
+        )
+        .first()
+        if user_id
+        else None
+    )
+
+    # --------------------------------------------------------
+    # Identify the administrator who generated it
+    # --------------------------------------------------------
+
+    generated_by_user = (
+        db.query(User)
+        .filter(
+            User.id == certificate.generated_by
+        )
+        .first()
+    )
+
+    return {
+        "id": str(certificate.id),
+        "scan_id": str(certificate.scan_id),
+        "certificate_number": certificate.certificate_number,
+        "document_title": scan.title,
+        "generated_at": (
+            certificate.generated_at.isoformat()
+            if certificate.generated_at
+            else None
+        ),
+        "generated_by": str(certificate.generated_by),
+        "generated_by_name": (
+            generated_by_user.full_name
+            if generated_by_user
+            else None
+        ),
+        "certificate_hash": certificate.certificate_hash,
+        "status": certificate.status,
+        "plagiarism_score_percent": plagiarism_score,
+        "ai_score": "N/A",
+        "user": (
+            {
+                "id": str(document_user.id),
+                "username": document_user.username,
+                "full_name": document_user.full_name,
+                "email": document_user.email,
+            }
+            if document_user
+            else None
+        ),
+    }
+
+
+# ============================================================
+# LIST ALL CERTIFICATES
+# GET /admin/certificates
+# ============================================================
+
+@router.get("/certificates")
+def list_admin_certificates(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(
+        require_roles("ADMIN")
+    ),
+):
+    certificates = (
+        db.query(Certificate)
+        .order_by(
+            Certificate.generated_at.desc()
+        )
+        .all()
+    )
+
+    return [
+        build_admin_certificate_response(
+            db,
+            certificate,
+        )
+        for certificate in certificates
+    ]
+
+
+# ============================================================
+# GET CERTIFICATE DETAILS
+# GET /admin/certificates/{certificate_id}
+# ============================================================
+
+@router.get("/certificates/{certificate_id}")
+def get_admin_certificate(
+    certificate_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(
+        require_roles("ADMIN")
+    ),
+):
+    certificate = (
+        db.query(Certificate)
+        .filter(
+            Certificate.id == certificate_id
+        )
+        .first()
+    )
+
+    if not certificate:
+        raise HTTPException(
+            status_code=404,
+            detail="Certificate not found.",
+        )
+
+    return build_admin_certificate_response(
+        db,
+        certificate,
+    )
+
+
+# ============================================================
+# DOWNLOAD CERTIFICATE PDF
+# GET /admin/certificates/{certificate_id}/download
+# ============================================================
+
+@router.get(
+    "/certificates/{certificate_id}/download"
+)
+def download_admin_certificate(
+    certificate_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(
+        require_roles("ADMIN")
+    ),
+):
+    certificate = (
+        db.query(Certificate)
+        .filter(
+            Certificate.id == certificate_id
+        )
+        .first()
+    )
+
+    if not certificate:
+        raise HTTPException(
+            status_code=404,
+            detail="Certificate not found.",
+        )
+
+    certificate_path = Path(
+        certificate.certificate_path
+    )
+
+    if not certificate_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "Certificate PDF file was not found."
+            ),
+        )
+    create_audit_log(
+    db,
+    user_id=current_user.id,
+    action="CERTIFICATE_DOWNLOAD_REQUESTED",
+    entity_type="CERTIFICATE",
+    entity_id=certificate.id,
+    new_values={
+        "certificate_number": certificate.certificate_number,
+        "outcome": "FILE_AVAILABLE",
+    },
+    )
+
+    db.commit()
+    return FileResponse(
+        path=str(certificate_path),
+        filename=(
+            f"{certificate.certificate_number}.pdf"
+        ),
+        media_type="application/pdf",
+    )
+
+# ============================================================
+# VERIFY CERTIFICATE INTEGRITY
+# GET /admin/certificates/verify/{certificate_number}
+# ============================================================
+
+@router.get(
+    "/certificates/verify/{certificate_number}"
+)
+def verify_admin_certificate(
+    certificate_number: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(
+        require_roles("ADMIN")
+    ),
+):
+    # --------------------------------------------------------
+    # Find certificate using its certificate number
+    # --------------------------------------------------------
+
+    certificate = (
+        db.query(Certificate)
+        .filter(
+            Certificate.certificate_number
+            == certificate_number
+        )
+        .first()
+    )
+
+    if not certificate:
+        raise HTTPException(
+            status_code=404,
+            detail="Certificate not found.",
+        )
+
+    # --------------------------------------------------------
+    # Ensure a hash was recorded during generation
+    # --------------------------------------------------------
+
+    if not certificate.certificate_hash:
+        return {
+            "certificate_number": (
+                certificate.certificate_number
+            ),
+            "verification_status": "UNVERIFIABLE",
+            "integrity_valid": None,
+            "message": (
+                "No recorded SHA-256 hash is available "
+                "for this certificate."
+            ),
+        }
+
+    # --------------------------------------------------------
+    # Check whether the stored PDF exists
+    # --------------------------------------------------------
+
+    certificate_path = Path(
+        certificate.certificate_path
+    )
+
+    if not certificate_path.is_file():
+        return {
+            "certificate_number": (
+                certificate.certificate_number
+            ),
+            "verification_status": "FILE_MISSING",
+            "integrity_valid": False,
+            "message": (
+                "The certificate PDF could not be found."
+            ),
+        }
+
+    # --------------------------------------------------------
+    # Calculate SHA-256 from the current PDF
+    # Read in chunks to avoid loading the whole file
+    # into memory.
+    # --------------------------------------------------------
+
+    sha256 = hashlib.sha256()
+
+    try:
+        with certificate_path.open("rb") as pdf_file:
+            for chunk in iter(
+                lambda: pdf_file.read(1024 * 1024),
+                b"",
+            ):
+                sha256.update(chunk)
+
+        calculated_hash = sha256.hexdigest()
+
+    except OSError:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Unable to read the certificate PDF "
+                "for verification."
+            ),
+        )
+
+    # --------------------------------------------------------
+    # Compare calculated and recorded hashes
+    # --------------------------------------------------------
+
+    integrity_valid = hmac.compare_digest(
+        calculated_hash.lower(),
+        certificate.certificate_hash.lower(),
+    )
+
+    if integrity_valid:
+        verification_status = "VERIFIED"
+        message = (
+        "The certificate PDF matches its recorded "
+        "SHA-256 hash."
+    )
+        audit_action = "CERTIFICATE_VERIFIED"
+    else:
+        verification_status = "HASH_MISMATCH"
+        message = (
+            "The certificate PDF does not match its "
+            "recorded SHA-256 hash."
+        )
+        audit_action = "CERTIFICATE_VERIFICATION_FAILED"
+
+    create_audit_log(
+        db,
+        user_id=current_user.id,
+        action=audit_action,
+        entity_type="CERTIFICATE",
+        entity_id=certificate.id,
+        new_values={
+            "certificate_number": certificate.certificate_number,
+            "outcome": verification_status,
+        },
+    )
+
+    db.commit()
+    # --------------------------------------------------------
+    # Return only verification information
+    # Do not expose the file path or user details.
+    # --------------------------------------------------------
+
+    return {
+        "certificate_number": (
+            certificate.certificate_number
+        ),
+        "verification_status": verification_status,
+        "integrity_valid": integrity_valid,
+        "message": message,
+    }
+
+
+
+# ============================================================
+# ADMIN AUDIT LOG VIEWER
+# ============================================================
+
+from fastapi import Query
+
+
+# ============================================================
+# LIST AUDIT LOGS
+# GET /admin/audit-logs
+# ============================================================
+
+@router.get("/audit-logs")
+def list_admin_audit_logs(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    action: str | None = Query(None),
+    entity_type: str | None = Query(None),
+    user_id: UUID | None = Query(None),
+    start_date: datetime | None = Query(None),
+    end_date: datetime | None = Query(None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(
+        require_roles("ADMIN")
+    ),
+):
+    query = db.query(AuditLog)
+
+    # --------------------------------------------------------
+    # Optional filters
+    # --------------------------------------------------------
+
+    if action:
+        query = query.filter(
+            AuditLog.action == action
+        )
+
+    if entity_type:
+        query = query.filter(
+            AuditLog.entity_type == entity_type
+        )
+
+    if user_id:
+        query = query.filter(
+            AuditLog.user_id == user_id
+        )
+
+    if start_date:
+        query = query.filter(
+            AuditLog.created_at >= start_date
+        )
+
+    if end_date:
+        query = query.filter(
+            AuditLog.created_at <= end_date
+        )
+
+    if (
+        start_date
+        and end_date
+        and start_date > end_date
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="start_date must not be after end_date.",
+        )
+
+    # --------------------------------------------------------
+    # Count matching records before pagination
+    # --------------------------------------------------------
+
+    total = query.count()
+
+    # --------------------------------------------------------
+    # Pagination
+    # --------------------------------------------------------
+
+    logs = (
+        query
+        .order_by(
+            AuditLog.created_at.desc(),
+            AuditLog.id.desc(),
+        )
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+        .all()
+    )
+
+    return {
+        "items": [
+            {
+                "id": str(log.id),
+                "user_id": (
+                    str(log.user_id)
+                    if log.user_id
+                    else None
+                ),
+                "action": log.action,
+                "entity_type": log.entity_type,
+                "entity_id": (
+                    str(log.entity_id)
+                    if log.entity_id
+                    else None
+                ),
+                "old_values": log.old_values,
+                "new_values": log.new_values,
+                "ip_address": (
+                    str(log.ip_address)
+                    if log.ip_address
+                    else None
+                ),
+                "created_at": (
+                    log.created_at.isoformat()
+                    if log.created_at
+                    else None
+                ),
+            }
+            for log in logs
+        ],
+        "pagination": {
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+            "total_pages": (
+                (total + page_size - 1) // page_size
+            ),
+        },
+    }
+
+
+# ============================================================
+# GET ONE AUDIT LOG
+# GET /admin/audit-logs/{log_id}
+# ============================================================
+
+@router.get("/audit-logs/{log_id}")
+def get_admin_audit_log(
+    log_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(
+        require_roles("ADMIN")
+    ),
+):
+    log = (
+        db.query(AuditLog)
+        .filter(
+            AuditLog.id == log_id
+        )
+        .first()
+    )
+
+    if not log:
+        raise HTTPException(
+            status_code=404,
+            detail="Audit log not found.",
+        )
+
+    return {
+        "id": str(log.id),
+        "user_id": (
+            str(log.user_id)
+            if log.user_id
+            else None
+        ),
+        "action": log.action,
+        "entity_type": log.entity_type,
+        "entity_id": (
+            str(log.entity_id)
+            if log.entity_id
+            else None
+        ),
+        "old_values": log.old_values,
+        "new_values": log.new_values,
+        "ip_address": (
+            str(log.ip_address)
+            if log.ip_address
+            else None
+        ),
+        "created_at": (
+            log.created_at.isoformat()
+            if log.created_at
+            else None
+        ),
+    }
+
+
+@router.post(
+    "/references",
+    response_model=ReferenceDocumentResponse,
+)
+async def add_reference(
+    title: str = Form(...),
+    document_type: str = Form("FTER"),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(
+        require_roles("ADMIN")
+    ),
+):
+    if not file.filename:
+        raise HTTPException(
+            status_code=400,
+            detail="File is required.",
+        )
+
+    extension = Path(file.filename).suffix.lower()
+    safe_filename = f"{uuid4()}{extension}"
+
+    upload_directory = (
+        Path(settings.upload_dir)
+        / "reference_documents"
+    )
+    upload_directory.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    destination = upload_directory / safe_filename
+
+    try:
+        file_size, sha256_hash = await save_reference_file(
+            file,
+            destination,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        )
+
+    existing = (
+        db.query(ReferenceDocument)
+        .filter(
+            ReferenceDocument.sha256_hash == sha256_hash,
+            ReferenceDocument.status != "DELETED",
+        )
+        .first()
+    )
+
+    if existing:
+        destination.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This document already exists "
+                "in the reference database."
+            ),
+        )
+
+    reference = ReferenceDocument(
+        title=title,
+        document_type=document_type,
+        file_name=file.filename,
+        file_path=str(destination),
+        file_size=file_size,
+        mime_type=file.content_type,
+        sha256_hash=sha256_hash,
+        status="ACTIVE",
+        current_version=1,
+        added_by=current_user.id,
+        approved_by=current_user.id,
+        approved_at=datetime.now(timezone.utc),
+    )
+
+    try:
+        db.add(reference)
+        db.flush()
+
+        version = ReferenceDocumentVersion(
+            reference_document_id=reference.id,
+            version_number=1,
+            file_name=file.filename,
+            file_path=str(destination),
+            sha256_hash=sha256_hash,
+            uploaded_by=current_user.id,
+            approved_by=current_user.id,
+            approved_at=datetime.now(timezone.utc),
+            change_reason="Initial reference upload",
+        )
+        db.add(version)
+
+        create_audit_log(
+            db,
+            user_id=current_user.id,
+            action="REFERENCE_CREATED",
+            entity_type="REFERENCE_DOCUMENT",
+            entity_id=reference.id,
+            new_values={
+                "title": title,
+                "document_type": document_type,
+                "file_name": file.filename,
+                "version": 1,
+            },
+        )
+
+        db.commit()
+        db.refresh(reference)
+
+    except Exception:
+        db.rollback()
+        destination.unlink(missing_ok=True)
+        raise
+
+    reference_id = str(reference.id)
+
+    # Automatically index the newly uploaded reference.
+    try:
+        sentence_count = index_reference_document(
+            db=db,
+            reference_document=reference,
+        )
+    except Exception as exc:
+        db.rollback()
+        print(
+            "Automatic reference indexing failed "
+            f"for {reference_id}: {exc}"
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Reference uploaded successfully, but indexing "
+                f"failed. Reference ID: {reference_id}. "
+                "Check backend logs and retry using the Admin "
+                "Index Reference endpoint."
+            ),
+        )
+
+    # Record the automatic indexing event.
+    try:
+        create_audit_log(
+            db,
+            user_id=current_user.id,
+            action="REFERENCE_INDEXED",
+            entity_type="REFERENCE_DOCUMENT",
+            entity_id=reference.id,
+            new_values={
+                "version": reference.current_version,
+                "sentence_count": sentence_count,
+                "trigger": "AUTOMATIC_UPLOAD",
+            },
+        )
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        print(
+            "Warning: reference indexing succeeded, but "
+            f"its audit record failed for {reference_id}: {exc}"
+        )
+
+    db.refresh(reference)
+
+    return ReferenceDocumentResponse(
+        id=str(reference.id),
+        title=reference.title,
+        document_type=reference.document_type,
+        file_name=reference.file_name,
+        file_size=reference.file_size,
+        mime_type=reference.mime_type,
+        sha256_hash=reference.sha256_hash,
+        status=reference.status,
+        current_version=reference.current_version,
+        added_by=(
+            str(reference.added_by)
+            if reference.added_by
+            else None
+        ),
+        approved_by=(
+            str(reference.approved_by)
+            if reference.approved_by
+            else None
+        ),
+    )
+

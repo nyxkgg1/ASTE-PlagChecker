@@ -1,0 +1,14 @@
+venv/
+__pycache__/
+*.py[cod]
+
+.env
+
+.pytest_cache/
+.mypy_cache/
+tests/
+uploads/
+
+.DS_Store
+.venv_old_misconfigured_20261031
+.venv
